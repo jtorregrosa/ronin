@@ -1,5 +1,7 @@
 # ronin
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 CLI to bring a RunPod pod serving a model up and down on demand, and to open a coding
 agent (opencode by default, or Claude Code) connected to it. The pod serves with **vLLM**
 (safetensors / FP8) or **llama.cpp**'s `llama-server` (GGUF), chosen per profile by
