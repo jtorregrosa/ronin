@@ -1,0 +1,16 @@
+[project]
+name = "ronin"
+version = "0.1.0"
+description = "Bring a RunPod vLLM pod up and down on demand and connect Claude Code to it"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ronin = "ronin.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ronin*"]

@@ -1,0 +1,14 @@
+.env
+.ronin/
+__pycache__/
+*.egg-info/
+.venv/
+
+# eval run artifacts (keep local)
+eval/results/
+
+# local backups
+*.bak
+
+# your own eval tasks (keep local)
+eval/tasks.jsonl

@@ -1,0 +1,189 @@
+# ronin configuration — profiles follow an internal model-comparison matrix (v3, 2026-10-21).
+# Secrets (RUNPOD_API_KEY, HF_TOKEN) live in .env, not here.
+#
+# Each profile is a tier (the GPU you can get) x use (general / coding / science).
+# Most tiers serve GGUF with llama.cpp (backend = "llamacpp"); the FP8 picks of medium
+# and huge serve with vLLM. Both expose OpenAI /v1, so `ronin opencode` is unchanged.
+#
+# Evidence tags from the report: [IND] independent measurement, [AUT] author's card,
+# [NV] not verified. reasoning_effort / max_new_tokens are CLIENT settings (opencode
+# sends them per request), not serve flags — they appear here only as guidance comments.
+# TIE-VALIDATE = no candidate has [IND] evidence on both axes; decide with your own A/B.
+
+[defaults]
+profile = "basic-general"
+# vLLM image (used only by the vLLM profiles below). Pinned.
+image = "vllm/vllm-openai:v0.32.0"
+# "ephemeral": weights downloaded on every `ronin up` (no fixed cost).
+# "volume": persistent network volume (fast boots, ~$0.07/GB/month, pinned datacenter).
+storage = "ephemeral"
+# Empty = any datacenter with stock (required with a volume). See `ronin gpus`.
+datacenter = ""
+volume_name = "ronin-models"
+volume_size_gb = 200
+# COMMUNITY: the report's reference prices, ~30-160 % below SECURE (4090: $0.34 vs $0.89/h),
+# on hosts RunPod does not run itself (less reliable, no network volumes). For a
+# volume-backed setup, or when a community host misbehaves, switch back to "SECURE".
+cloud = "COMMUNITY"
+port = 8000
+# Name the server exposes the model under (vLLM --served-model-name / llama.cpp --alias).
+served_name = "ronin"
+# Coding agent `ronin opencode` launches: "opencode" or "claude".
+client = "opencode"
+# The pod deletes itself after max_hours of uptime, or after idle_minutes without
+# requests, even if your PC is off. 0 disables each. Override with `ronin up --max-hours`.
+max_hours = 8
+idle_minutes = 60
+
+# GPU ids are RunPod's (`ronin gpus` prints the exact strings and current stock).
+# Tier -> GPU (profiles.yaml): basic = RTX 4090 24GB, medium = L40S 48GB,
+# big = RTX PRO 6000 96GB Blackwell, huge = 4x H200.
+
+# ======================================================================= basic (4090)
+
+# basic-general: best 27B overall per the report (ranking #1, 82.2 %).
+# [IND] abliterlitics: harmful-only 96.7 %, delivered 71.0 %, drift 0.48 pp (lowest of 12).
+# reasoning_effort = medium|xhigh (client). sampling (thinking): temp 1.0, top-p 0.95, top-k 20.
+# alt_low_drift: 0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored (RVN-Q4_K_M-mtp).
+# alt_conservative: trohrbaugh/Qwen3.8-27B-heretic-ara (fewer loops, lower unlock).
+[profiles.basic-general]
+backend = "llamacpp"
+model = "bartowski/orcarouter_Qwen3.8-27B-Uncensored-GGUF:Q4_K_M"   # 17.77 GB
+gpus = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 5090"]
+disk_gb = 40
+# text-only: skip the vision mmproj. KV stays f16 (fits 24 GB at 64K).
+llamacpp_args = ["-c", "65536", "-ngl", "99", "-fa", "on", "--no-mmproj"]
+
+# basic-coding: TIE-VALIDATE. user_choice (2026-10-21) = huihui Coder390, pending A/B
+# against orcarouter (the only candidate with [IND] on both axes). MTP speculative head.
+# [IND] huihui method harmful-only 98.0 % but delivered 58.8 %, loops 40 % (on the base).
+# A/B: refusal rate (thinking on), % loop-free, LCB-100, and tasks from your repos.
+[profiles.basic-coding]
+backend = "llamacpp"
+model = "mradermacher/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated-i1-GGUF:Q4_K_M"
+gpus = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 5090"]
+disk_gb = 40
+# draft-mtp uses the model's own MTP head (needs the MTP-carrying GGUF); drop if it errors.
+llamacpp_args = ["-c", "49152", "-ngl", "99", "-fa", "on",
+                 "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
+
+# basic-science: ties the base in science ([IND] GPQA -1.0, MMLU-Pro -0.0, all within noise).
+# reasoning_effort = xhigh, max_new_tokens ~57344 (client; base uses 50.6K at GPQA P90).
+# Q6_K 23.46 GB on a 5090; Q4_K_M on a 4090. KV q8_0 to fit 64K.
+[profiles.basic-science]
+extends = "basic-general"
+llamacpp_args = ["-c", "65536", "-ngl", "99", "-fa", "on", "--no-mmproj",
+                 "-ctk", "q8_0", "-ctv", "q8_0"]
+
+# ====================================================================== medium (L40S)
+
+# medium-general: same model as basic, full-ish context on Ada's native FP8 (vLLM).
+# Mirror id-2/* has identical sha256 to orcarouter's gated FP8. Do NOT pass --quantization
+# fp8 (the card says so). Its chat template emits XML tool calls
+# (<function=...><parameter=...>), so the parser is qwen3_coder, not hermes.
+[profiles.medium-general]
+model = "id-2/Qwen3.8-27B-Uncensored-FP8"   # 30.87 GB
+gpus = ["NVIDIA L40S", "NVIDIA RTX A6000"]
+disk_gb = 50
+vllm_args = [
+  "--max-model-len", "131072",
+  "--gpu-memory-utilization", "0.92",
+  "--max-num-seqs", "16",            # hybrid model: one Mamba block per sequence
+  # vision-language model, but the agent only sends text: skip the multimodal warmup
+  # and give the encoder's KV budget to the text context
+  "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "qwen3_coder",
+  "--reasoning-parser", "qwen3",
+  "--enable-prefix-caching",
+]
+
+# medium-coding: huihui Coder390 GGUF Q6_K with MTP on the L40S. TIE-VALIDATE, same A/B
+# as basic-coding. alt (A6000): nerkyor INT8 W8A16 via vLLM. alt_fast: dealignai
+# Ornith-1.5-35B-A3B CRACK. Benchmarked on L40S secure (2026-10-22, decode tok/s at 41K
+# context / short prompt): Q8_0 + KV q8_0 38.6 / 50.8 · Q6_K + KV q8_0 55.9 / 69.7 ·
+# Q6_K + KV f16 59.7 / 65.8 · same with MTP n-max 4 51.2 / 66.0 (acceptance drops to 43 %).
+# qwen35 is hybrid (1 attention layer in 4), so KV is ~68 KiB/token in f16 (128K = ~8.5 GiB).
+# 128K: opencode compacts at ~111K. At 192K it ran sessions up to ~175K, and above ~140K
+# the model thought in loops for 3-6K tokens without calling tools (2026-10-22 session).
+[profiles.medium-coding]
+backend = "llamacpp"
+model = "mradermacher/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated-GGUF:Q6_K"   # 22.43 GB
+gpus = ["NVIDIA L40S", "NVIDIA RTX A6000"]
+disk_gb = 60
+llamacpp_args = ["-c", "131072", "-ngl", "99", "-fa", "on", "--no-mmproj",
+                 "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
+
+# medium-science: same vLLM FP8 as medium-general, longer reasoning budget (client xhigh).
+[profiles.medium-science]
+extends = "medium-general"
+
+# ============================================================= big (RTX PRO 6000 96GB)
+
+# big-general: Flash-Next (125B MoE / 6B active), SC117's abliteration on the ISTA
+# GSQ-RCO quant, as GGUF for llama.cpp master. [AUT ISTA] IQ3_S GPQA 92.9, LCB 86.9.
+# Two shards in IQ3_S/ (55.06 GB + a 28.8 GB n-gram/PLE table): -hf fetches both, and the
+# table stays on the host via mmap (lazy-loaded), out of VRAM. SC117's build ships correct
+# qwen4exp.attention.compress_ratios ([0,0,0,4,...], checked in the header); the alt GGUFs
+# below (heretic-2 / mradermacher) are the ones with zeros. MTP is left commented: SC117's
+# own mtp file uses the old layout, so it borrows spiritfather's draft:
+#   "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
+#   "-hfd", "spiritfather/Qwen3.8-Flash-Next-heretic-2-i1-GGUF",
+#   "-hffd", "mtp/mtp-Qwen3.8-Flash-Next-heretic-2-Q8_0.gguf",
+# alt_no_thinking: trohrbaugh/...-heretic-2 (willingness higher with thinking off).
+[profiles.big-general]
+backend = "llamacpp"
+model = "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:IQ3_S"   # ~51 GiB in VRAM
+gpus = ["NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "NVIDIA H200"]
+disk_gb = 200
+# KV 24 KiB/token in f16; ~80 GiB total at 196K. Text only: skip the mmproj.
+llamacpp_args = ["-c", "196608", "-ngl", "99", "-fa", "on", "-lm", "mmap", "--no-mmproj"]
+
+# big-coding: same model (base DeepSWE 58.7, SWE-bench Pro 62.5). reasoning_effort = medium.
+[profiles.big-coding]
+extends = "big-general"
+
+# big-science: same model, KV q8_0 for headroom. reasoning_effort = xhigh (client).
+# Note: AtomicChat reports loops at xhigh on their build; unverified on this one [NV].
+[profiles.big-science]
+extends = "big-general"
+llamacpp_args = ["-c", "196608", "-ngl", "99", "-fa", "on", "-lm", "mmap", "--no-mmproj",
+                 "-ctk", "q8_0", "-ctv", "q8_0"]
+
+# ================================================================= huge (4x H200, TP4)
+
+# huge-general: GLM-5.3-Flash uncensored, FP8 native on Hopper, tensor-parallel over 4.
+# [AUT] MMLU 87.33; 0 % refusals on HarmBench-320. The card measures 163 tok/s in TP4.
+# Adjust the GLM tool/reasoning parser names to your vLLM build if they differ.
+# reasoning: effort low|high|max (default max), chat clear_thinking=true; do NOT pass
+# enable_thinking; keep max_tokens >= 6000 (client). alt_cheap: the NVFP4 build on Blackwell.
+[profiles.huge-general]
+model = "dealignai/GLM-5.3-Flash-UNCENSORED-FP8"   # 328.3 GB
+gpu_count = 4
+gpus = ["NVIDIA H200", "NVIDIA RTX PRO 6000 Blackwell Server Edition"]
+disk_gb = 400
+vllm_args = [
+  "--max-model-len", "131072",
+  "--gpu-memory-utilization", "0.90",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "glm45",
+  "--reasoning-parser", "glm45",
+  "--enable-prefix-caching",
+]
+
+# huge-coding / huge-science: base DeepSeek-V4.1-Flash-1017 (DeepSWE 77.0, best open coder;
+# HLE 42.6 for science). These need the SGLANG backend (engram host table of 203 GB in host
+# RAM, TP4 + EP4), which ronin does not serve yet — left commented until a sglang backend
+# lands. TIE-VALIDATE between dealignai/...-UNCENSORED-FP8 and pqhaz/...-heretic (patch).
+#
+# [profiles.huge-coding]
+# backend = "sglang"   # NOT SUPPORTED YET
+# model = "dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8"   # 510.3 GB
+# gpu_count = 4
+# gpus = ["NVIDIA H200"]
+# disk_gb = 600
+#
+# [profiles.huge-science]
+# extends = "huge-coding"   # NOT SUPPORTED YET (reasoning effort = max, max_tokens >= 256K)
