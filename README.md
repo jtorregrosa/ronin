@@ -212,6 +212,21 @@ All profiles use `storage = "ephemeral"`, so each `ronin up` downloads the weigh
 `ronin down` discards them (no fixed volume cost, slower boots). See `ronin profiles` for
 the terse model/GPU/backend/context listing.
 
+### Keeping the matrix current
+
+New abliterated models appear on Hugging Face every day. `scout/` is a standalone
+helper that finds them, checks which tier each fits, asks Claude (`claude -p`) for a
+verdict against the baseline study the matrix came from, and writes a dated report in
+`scout/reports/` with profiles to paste and the `eval/` A/B commands to validate them.
+It never edits `ronin.toml` or starts a pod.
+
+```powershell
+python scout/run.py              # full run (needs Claude Code on PATH for the verdict)
+python scout/run.py --no-judge   # without Claude
+```
+
+See [`scout/README.md`](scout/README.md).
+
 ## Console output
 
 - Steps `›`, success `✓`, warnings `!` and errors `✗`, with subtle colours (commands

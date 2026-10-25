@@ -1,0 +1,164 @@
+# Perfiles modelo/pod para LLMs abliterated/uncensored, v3 (ronda 2 de auditoría aplicada, 2026-10-21).
+# Ronda 2: data/verification/round2/*.md. La v2 queda en data/verification/round2/profiles-v2-pre-round2.yaml.
+# decision: TIE-VALIDATE = ningún candidato tiene evidencia [IND] en los dos ejes (cumplimiento y capacidad); hay que decidir con un A/B.
+# abliterlitics distingue unlocked (% que cumpliría) de delivered (% que además termina la respuesta, sin bucle). Mide con temp 0 y un límite de 15,360 tokens: es el peor caso.
+# La auditoría completa está en data/verification/{basic,medium,big,huge}/AUDIT.md y en data/verification/pricing.md.
+# La v1 queda en data/verification/profiles-v1-pre-audit.yaml.
+#
+# Origen de cada dato:
+#   [IND] medición independiente del mismo protocolo sobre varios modelos (abliterlitics.dev o satellitedown)
+#   [AUT] publicado por quien sube el modelo (verificado que la cifra aparece en su card, no que sea cierta)
+#   [NV]  sin medir / no verificable
+#
+# Precios: RunPod community en USD por hora y pod completo, re-consultados el 2026-10-21.
+# Secure cuesta entre +30 % (B300) y +162 % (4090) más que community.
+# La RAM mínima del pod (minMemory) varía con cada consulta: al desplegar, filtra por la RAM indicada.
+# Todos los modelos son razonadores. Fija reasoning_effort de forma explícita: algunos chat templates traen otro valor por defecto.
+
+tiers:
+  basic:  {pod: "1x RTX 4090 24GB", usd_h: 0.34, alt_pod: "1x RTX 5090 32GB (0.69)", ram_gb: ">=32"}
+  medium: {pod: "1x L40S 48GB (Ada: FP8 nativo)", usd_h: 0.79, alt_pod: "1x RTX A6000 48GB (0.33): GGUF o INT8 W8A16; el FP8 corre como W8A16 vía Marlin, más lento", ram_gb: ">=64"}
+  big:    {pod: "1x RTX PRO 6000 96GB (Blackwell)", usd_h: 1.69, alt_pod: "1x H200 141GB (3.59)", ram_gb: ">=128", disk_gb: ">=200"}
+  huge:   {pod: "4x H200 (14.36) | 4x RTX PRO 6000 (6.76) | 8x H100 (21.52)", usd_h: 14.36, ram_gb: ">=500 (DeepSeek mueve la tabla engram de 203 GB a RAM del host)", disk_gb: ">=600 (network volume)"}
+
+profiles:
+
+  basic-general:
+    model: orcarouter/Qwen3.8-27B-Uncensored            # el original es gated; usa el GGUF de bartowski, que no lo es
+    file: "bartowski/orcarouter_Qwen3.8-27B-Uncensored-GGUF :: Q4_K_M 17.77 GB (+ mmproj 0.93 GB para visión)"
+    runtime: llama.cpp (master reciente)
+    context: 65536
+    kv_cache: "f16 si es solo texto; q8_0 si cargas el mmproj"
+    reasoning: {default: on, set: "reasoning_effort=medium|xhigh explícito"}
+    sampling: {thinking: {temperature: 1.0, top_p: 0.95, top_k: 20}, no_thinking: {temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 1.5}}
+    evidence: "[IND] abliterlitics, 12 variantes de Qwen3.8-27B: 1º en el ranking global (82.2 %); harmful-only 96.7 % (3º); delivered 71.0 % (2º); bucles 26.5 %; mean abs Δ 0.48 pp (el menor de los 12); KL 0.068. [AUT] Método: Arditi k=1, capa 38 = round(0.6x64), 131 matrices."
+    alt_low_drift: "0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored (RVN, ARA en 2 pasadas) :: RVN-Q4_K_M-mtp 17.00 GB. [IND] unlocked 92.0 %, delivered 70.2 %, bucles 23.8 %, Δ 0.73 pp, 15/400 refusals explícitos; medido directamente sobre ese GGUF"
+    alt_conservative: "trohrbaugh/Qwen3.8-27B-heretic-ara (= heretic-org, mismos hashes). [IND] unlocked 76.3 %, 122/400 refusals, Δ 0.57 pp, bucles 14.8 % (los menos). Bucoid IQ4_XS 14.3 GB: el nombre interno del GGUF coincide con RVN, así que no se sabe si es 1 o 2 pasadas [NV]"
+    alt_writing: "decision: TIE-VALIDATE. coder3101/gemma-4-31B-it-heretic (UGI 65.69, NatInt 36.53, Writing 40.49; GGUF mradermacher/gemma-4-31B-it-heretic-i1-GGUF Q4_K_M 18.69 GB, sin mmproj) frente a llmfan46/gemma-4-31B-it-uncensored-heretic (UGI 64.99, NatInt 36.41, Writing 40.61; GGUF llmfan46 Q4_K_M 18.7 GB + mmproj 1.20 GB). Base con thinking: NatInt 38.91, Writing 43.07. A 64K en 24 GB, KV q8_0 obligatorio"
+
+  basic-coding:
+    decision: TIE-VALIDATE
+    user_choice: huihui-ai/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated   # elegido por el usuario el 2026-10-21, a la espera del A/B
+    default_until_ab: orcarouter/Qwen3.8-27B-Uncensored   # el único candidato con [IND] en los dos ejes
+    runtime: llama.cpp con MTP
+    context: 49152
+    reasoning: {set: "reasoning_effort=medium"}
+    candidates:
+      - repo: orcarouter/Qwen3.8-27B-Uncensored
+        file: "bartowski Q4_K_M 17.77 GB"
+        evidence: "[IND] harmful-only 96.7 %, delivered 71.0 %, bucles 26.5 %, Δ 0.48 pp"
+      - repo: nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2
+        file: "nerkyor/...-SFT-RLOO-GGUF-NInfer :: Q3LynnStyle-MTP 17.30 GB"
+        evidence: "[AUT] GPQA/MMLU/LCB-100 173/449/92 (Q3) y 175/448/89 (Q4). Entre cuantizaciones, LCB-100 es ruido (n=100). El base saca 83 con el protocolo de nerkyor (límite de 94K, 13 truncados frente a ~3); el LCB v6 oficial del base es 90.3. Su padre rechaza 4/140 [AUT]; los refusals del Coder390 [NV]"
+      - repo: huihui-ai/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated
+        file: "mradermacher/...-abliterated-i1-GGUF Q4_K_M (~17 GB, con MTP)"
+        evidence: "[IND] el método huihui sobre el base Qwen3.8-27B (capas 17-51): harmful-only 98.0 %, pero delivered 58.8 % (9º de 12), bucles 40.0 %, Δ 0.84 pp, TruthfulQA -3.3. [NV] esta edición (capas 2-52 sobre un fine-tune)"
+    ab_test: "Mismos prompts y contexto de 49K: tasa de refusals con thinking on, % de respuestas sin bucle, LCB-100 y tareas de tus repos"
+    alt_fast: "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF CRACK Q4_K_M 21.71 GB ([AUT] MMLU -2.2, HarmBench-240 100 %); gbuzhf Ornith ...-21G-ICE 20.85 GB ([AUT] KLD de abliteration 0.0151; KLD de cuantización 0.0395; refusals [NV]). La cabeza MTP de Ornith no está entrenada, así que no acelera"
+
+  basic-science:
+    model: orcarouter/Qwen3.8-27B-Uncensored
+    file: "bartowski :: Q4_K_M 17.77 GB (4090) | Q6_K 23.46 GB (5090)"
+    runtime: llama.cpp
+    context: 65536
+    kv_cache: q8_0
+    reasoning: {set: "reasoning_effort=xhigh", max_new_tokens: 57344}   # el base usa 50.6K tokens en el P90 de GPQA (dato de nerkyor)
+    evidence: "[IND] en ciencia empata con el base: GPQA -1.0, MMLU-Pro -0.0, GSM8K -0.5 (todo dentro del ruido). [AUT Qwen] base GPQA 89.2, HLE 30.8. Ocupa ~20.4 GiB a 64K en la 4090 (Q4_K_M) y ~25.7 GiB en la 5090 (Q6_K)"
+    alt_validate: "DavidAU TURBO-Fable NM-DAU GGUF MTP-Q4_K_M 18.50 GB. [IND] delivered 85.3 % (el mejor) y GPQA +18.2 por loglik, pero es un merge: GSM8K -4.4, IFEval -5.0, TruthfulQA -5.1. Los ejes se contradicen"
+    note: "Descartado: llmfan46 MPOA ([IND] KL 0.2996, TruthfulQA -4.5/-6.4, bucles 37 %). Descartado: Nemotron-Bolt-24GB por capacidad (GPQA 86.4 / HLE 25.3, frente a 89.2 / 30.8). Sus refusals dependen del modo: AtomicChat midió 40.7 % con thinking off y 0/30 con thinking on"
+
+  medium-general:
+    model: orcarouter/Qwen3.8-27B-Uncensored
+    file: "FP8 30.87 GB: orcarouter/...-FP8 (gated) o su espejo sin gating id-2/Qwen3.8-27B-Uncensored-FP8 | GGUF Q8_0 29.12 GB (bartowski)"
+    runtime: "vLLM (FP8 nativo en Ada) | llama.cpp"
+    context: 131072
+    reasoning: {default: on}
+    evidence: "[IND] igual que en basic-general. El espejo id-2 tiene los mismos sha256 que orcarouter FP8 en los 7 shards, config y tokenizer (sin fichero LICENSE). [AUT orcarouter FP8] MMLU-Pro -0.8 frente al FP8 oficial. Con vLLM no pases --quantization fp8 (lo dice la card de orcarouter)"
+    alt_low_drift: "apostate KCRN [IND]: KL 0.044, Δ 0.64 pp, harmful-only 95.0 %, delivered 71.9 %. Probable GGUF: mradermacher/qwen-3.8-27b-abliterated-GGUF Q8_0 28.6 GB (lo deduzco por fecha y nº de parámetros; sin MTP ni visión) [NV]"
+    alt_conservative: "magiccodingman/Qwen3.8-27B-heretic-ara-fp8 30.87 GB ([AUT] KL 0.003 frente a su BF16; [IND] heretic-ara: unlocked 76.3 %, 122/400 refusals)"
+    alt_bigger: "decision: TIE-VALIDATE (las dos combinaciones a Q2 están sin medir [NV]). (a) ISTA Q2_0 + LoRA AtomicChat a escala 1.25. (b) SC117 Q2_0 (38.02 GB en VRAM, ablación de orcarouter). Tabla de AtomicChat a Q8_0, mismo protocolo: KLD / MMLU = LoRA 0.026 / 86.50, orcarouter 0.022 / 86.65, heretic-2 0.019 / 87.20. ISTA Q2_0 frente a su BF16: GPQA -2.5, AIME -3.3, LCB -6.3. A 128K la visión cabe (~41 GiB); MTP no. AtomicChat avisa de que su xhigh no está listo para producción"
+
+  medium-coding:
+    decision: TIE-VALIDATE   # mismos candidatos y A/B que basic-coding
+    user_choice: huihui-ai/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated   # elegido por el usuario el 2026-10-21
+    default_until_ab: orcarouter/Qwen3.8-27B-Uncensored
+    context: "65536-98304 (128K va muy justo en 48 GB: usa KV fp8)"
+    reasoning: {set: "reasoning_effort=medium"}
+    candidates:
+      - repo: orcarouter/Qwen3.8-27B-Uncensored
+        file: "FP8 30.87 GB (id-2, espejo verificado) | bartowski Q8_0 29.12 GB"
+        runtime: "vLLM FP8 | llama.cpp MTP"
+      - repo: nerkyor/Qwen3.8-27B-Coder390-...-MTP-DFlash2
+        file: "FP8 31.26 GB + draft DFlash2 2.41 GB | GGUF Q8_0-MTP 29.07 GB"
+        runtime: "SGLang (probado por nerkyor en 0.5.21; DFlash2 solo está validado en SGLang). Con vLLM 0.28, MTP no funciona por ahora en FP8"
+        speed: "[AUT] 171 tok/s con el draft actual, 1 petición, RTX PRO 6000. En sm_89 (L40S) no está probado [NV]"
+      - repo: huihui-ai/Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated
+        file: "no existe FP8: hazlo tú desde el BF16 de 55.56 GB | mradermacher GGUF Q8_0 29.05 GB (static, con MTP)"
+        runtime: "llama.cpp MTP | vLLM/SGLang FP8 propio. No publica draft DFlash2; incoai/Qwen3.8-27B-DFlash2 es un draft para el base [NV en este fine-tune]"
+    a6000: "nerkyor INT8 W8A16 (vLLM) o GGUF Q8_0"
+    alt_fast: "dealignai Ornith-1.5-35B-A3B CRACK Q8_0 37.80 GB ([AUT] MMLU 79.0->80.7 en un subconjunto de tamaño no publicado: ruido; HarmBench-240 100 %; aplican una intensidad de cirugía distinta a cada cuantización) o gbuzhf UD-Q6_K 30.2 GB ([AUT] KLD de abliteration 0.0151; refusals [NV])"
+
+  medium-science:
+    model: orcarouter/Qwen3.8-27B-Uncensored
+    file: "FP8 30.87 GB (vLLM) | Q8_0 29.12 GB"
+    runtime: "vLLM FP8 | llama.cpp"
+    context: 131072
+    reasoning: {set: "reasoning_effort=xhigh", max_new_tokens: 57344}
+    evidence: "[IND] GPQA -1.0, MMLU-Pro -0.0, GSM8K -0.5 frente al base. [AUT Qwen] base GPQA 89.2, HLE 30.8"
+    alt_bigger: "Flash-Next a Q2 (ver medium-general.alt_bigger). Solo hay HLE 35.9 en BF16; ninguna cuantización publica HLE. A Q2_0 el GPQA queda ~89.2, empatado con el 27B. A xhigh es justo el modo que AtomicChat marca como no listo"
+
+  big-general:
+    model: orcarouter/Qwen3.8-Flash-Next-Uncensored (ablación trasplantada por SC117 sobre la cuantización ISTA GSQ-RCO)
+    file: "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF :: IQ3_S (shard 1: 55.06 GB = 51.28 GiB en VRAM; shard 2 n-gram 28.8 GB vía mmap) + MTP: spiritfather/Qwen3.8-Flash-Next-heretic-2-i1-GGUF :: mtp/mtp-Qwen3.8-Flash-Next-heretic-2-Q8_0.gguf 4.14 GB (el mtp del propio SC117 está en el layout antiguo)"
+    runtime: "llama.cpp master (MTP para qwen4exp desde el 2026-10-01, PR #29761): -ngl 99 -lm mmap --spec-draft-model mtp-...-Q8_0.gguf --spec-draft-n-max 4"
+    context: 196608   # KV de 24 KiB/token en f16; ~80 GiB en total a 196K
+    reasoning: {default: on, toggle: enable_thinking}
+    evidence: "[IND CaliperBench, thinking on] orcarouter: C1 v2 0.0, C3 v2 0.2, willingness_v2 0.8. heretic-2: C1/C3 v2 1.0, willingness_v2 0.0 (igual que el stock). [IND AtomicChat Q8_0] KLD/MMLU orcarouter 0.022/86.65, heretic-2 0.019/87.20, original 0.017/86.70. [AUT ISTA] IQ3_S sin abliterar GPQA 92.9, LCB 86.9 (-0.57 frente a BF16). SC117 sí trae compress_ratios correcto (atención QSA). [NV] refusals del build de SC117"
+    alt_no_thinking: "trohrbaugh/Qwen3.8-Flash-Next-heretic-2 vía spiritfather i1 IQ4_XS (~66 GiB en VRAM). Con thinking off: willingness_v2 0.3. Ojo: el GGUF trae qwen4exp.attention.compress_ratios a cero, así que master ejecuta atención densa; corrige ese metadato en el shard 1 (10.9 MB) para contexto largo"
+    license: "qwen-community-1.0: permite derivados y uso comercial, pero un negocio MaaS o de asistentes de código/oficina necesita una licencia aparte de Qwen"
+    alt_quant: "mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF i1-IQ4_XS (97.47 GB en disco, ~64 GiB en GPU; misma ablación de orcarouter). Trae compress_ratios a cero: corrígelo antes de usar contexto largo. Frente a IQ3_S GSQ-RCO no hay datos del mismo protocolo [NV]"
+    h200_alt: "orcarouter Q6_K (~105.5 GiB en VRAM; revisa el mismo metadato)"
+  big-coding:
+    model: igual que big-general (base DeepSWE 58.7, SWE-bench Pro 62.5, SWE-bench Multilingual 81.0 [AUT Qwen])
+    context: 196608
+    reasoning: {set: "reasoning_effort=medium"}
+    note: "Descartado DeepSeek-V4-Flash huihui Q2: con el mismo protocolo de NVIDIA, Flash-Next gana (TB2.1 85.8 frente a 76.8). Además su Q2 recibió una ablación más débil que su Q4. [AUT cygnal] HumanEval+ de heretic-2 84.1 frente a 82.3 del base: paridad"
+  big-science:
+    model: igual que big-general
+    reasoning: {set: "reasoning_effort=xhigh"}
+    note: "AtomicChat reporta bucles a xhigh en su build; en orcarouter y heretic-2 no está comprobado [NV]"
+    alt: "Qwen3.8-27B orcarouter BF16 en H200 con 1M de contexto (necesita YaRN; KV ~64 GiB en f16)"
+
+  huge-general:
+    model: dealignai/GLM-5.3-Flash-UNCENSORED-FP8
+    file: "safetensors FP8 328.3 GB"
+    pod: "4x H200 (14.36 $/h). La card lo mide en TP4 sobre H200: 163 tok/s"
+    runtime: "vLLM --tensor-parallel-size 4 (FP8 nativo en Hopper). TP=3 no es válido"
+    reasoning: {effort: [low, high, max], default: max, chat: "clear_thinking=true", max_tokens: ">=6000 (con effort max, un max_tokens pequeño devuelve respuesta vacía)", note: "no pases enable_thinking"}
+    evidence: "[AUT] MMLU absoluto 87.33 frente a 85.28 de la NVFP4, mismo harness de 1,026 preguntas (los deltas se miden contra bases distintas: 86.74 y 86.16). Refusals: 0 % en HarmBench-320 con effort off/max en las dos. [NV] independiente: no hay ninguna evaluación de este tier en UGI ni en abliterlitics"
+    alt_cheap: "dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 194.7 GB en 4x RTX PRO 6000 (6.76) o 4x H100 (10.76). vLLM --tensor-parallel-size 4 --moe-backend marlin: en Hopper corre como W4A16 de solo pesos. La card no valida el ajuste en 4x RTX PRO 6000 [NV]. [AUT] refusals ~4 % con effort high y ~9 % con low"
+    alt_tie: "orcarouter/GLM-5.3-Flash-Uncensored-FP8 (gated, no publica MMLU; su cifra de JailbreakBench 0.120 no se puede comparar con HarmBench). Es TIE-VALIDATE, no una sustitución"
+
+  huge-coding:
+    base: deepseek-ai/DeepSeek-V4.1-Flash-1017   # KEEP: [AUT DeepSeek] DeepSWE 77.0, NL2Repo 68.2, ProgramBench 29.1 frente a 66.9 / 58.0 / 19.0 de GLM-5.3
+    decision: TIE-VALIDATE (variante uncensored)
+    pod: "4x H200 (14.36 $/h). Alternativa: 8x H100 (21.52; necesita EP8 [NV])"
+    candidates:
+      - repo: dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8   # sin gating (api gated=False)
+        file: "FP8 + expertos FP4, 510.3 GB"
+        evidence: "[AUT] MMLU-20x57: 87.63->83.77 (-3.86 pp). Sin los dos temas morales, -2.9. Hay un confound: el base se midió por la API de DeepSeek. Validado con el motor inference/ de referencia en 4x H200 (TP4)"
+      - repo: pqhaz/DeepSeek-V4.1-Flash-1017-heretic
+        file: "511.9 GB, o patch/ de 1.6 GB (38 tensores attn.wo_b) aplicado sobre el base"
+        evidence: "[AUT] KL 0.136. Refusals con reasoning on: 1/100 (base 92/100). Sin benchmarks de capacidad. SGLang TP4+EP4 probado con lmsysorg/sglang:dev-dsv41"
+    ab_test: "En un único pod 4x H200: base + parche pqhaz y dealignai, con el mismo harness (MMLU completo, un benchmark de código y tasa de refusals con reasoning on)"
+    runtime: "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 (tabla engram de 203 GB a RAM del host); SGLang dsv4.1 --tp-size 4 --ep-size 4 --mem-fraction-static 0.80 --trust-remote-code + parsers de reasoning y tool-call de deepseek-v41. Con TP4 sin EP falla: 2304/4 no es múltiplo de 128"
+    reasoning: {effort: [low, high, max]}
+    alt_glm: "dealignai/GLM-5.3-ABLITERATED-NVFP4 464.8 GB en 8x H100 vía Marlin ([AUT] MMLU -1.47; base DeepSWE 66.9 frente a 77.0 de DS-1017). La card la prueba en 8x DGX Spark; en Hopper no está validada y necesita FlashInfer >= 0.6.18 [NV]"
+    alt_cheaper: "dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw, checkpoint de septiembre, 210.6 GB ([AUT] MMLU-14k -2.95; sin el clúster de ética -0.58). En 3x RTX PRO 6000 (5.07) con TabbyAPI layer-split [NV en este hardware]"
+  huge-science:
+    base: deepseek-ai/DeepSeek-V4.1-Flash-1017   # [AUT] HLE sin tools 42.6 (44.0 en el subconjunto de texto) frente a 42.0 de GLM-5.3 (texto)
+    decision: TIE-VALIDATE (mismos candidatos y A/B que huge-coding)
+    pod: "4x H200 (14.36)"
+    reasoning: {set: "effort=max", max_tokens: ">=256K"}
+    evidence: "[AUT dealignai] STEM de MMLU -2.37 pp en la variante uncensored"
+    note: "Kimi-K3 abliterated (Uniboshi, 1.56 TB) descartado: repo gated, método no verificable y sin stock de 8x B300"

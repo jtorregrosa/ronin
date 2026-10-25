@@ -1,0 +1,83 @@
+# scout: what to watch on Hugging Face and how to map it onto ronin's tiers.
+# Read by scout/run.py; ronin itself never reads this file.
+
+[search]
+# Substrings searched in repo ids (Hugging Face's `search`), newest first.
+keywords = ["abliterated", "heretic", "uncensored", "crack", "decensored"]
+# How far back each run looks. Already-reported repos are skipped (.ronin/scout-state.json),
+# so a repo that becomes popular later still shows up while it is inside the window.
+window_days = 21
+# Upper bound on candidates enriched per run (each costs two Hugging Face requests).
+max_candidates = 40
+
+[filter]
+# Authors whose uploads always pass the popularity filter.
+trusted_authors = ["bartowski", "mradermacher", "huihui-ai", "dealignai", "SC117",
+                   "orcarouter", "unsloth", "trohrbaugh", "0bserverx", "spiritfather",
+                   "nerkyor", "id-2", "pqhaz"]
+ignored_authors = []
+# Everyone else needs one of these (a brand-new repo has 0 downloads: it comes back on a
+# later run, inside window_days, once it gets traction).
+min_downloads = 50
+min_likes = 3
+# Formats ronin cannot serve (vLLM safetensors or llama.cpp GGUF only).
+skip_tags = ["mlx", "exl2", "exl3", "onnx", "openvino", "peft", "lora", "coreml"]
+# Smaller models are noise for a coding agent (billions of parameters; unknown sizes pass).
+min_params_b = 14
+
+# Model families: a candidate belongs to one when a pattern (regex, case-insensitive)
+# matches its repo id or its base_model. The live profiles of a family are found the
+# same way, from their `model`. Candidates outside every family are still listed (from
+# trusted authors only) so new base models are not missed.
+[families.qwen3_8-27b]
+patterns = ['qwen3\.8-27b']
+
+[families.qwen3_8-flash-next]
+patterns = ['qwen3\.8-flash-next']
+
+[families.glm-5_3]
+patterns = ['glm-5\.3']
+
+[families.deepseek-v4_1-flash]
+patterns = ['deepseek-v4\.1-flash']
+
+# Watched without a live profile (scout report 2026-10-25): Ornith for big, MiMo for huge.
+[families.ornith-1_5-122b]
+patterns = ['ornith-1\.5-122b']
+
+[families.mimo-v2_6-flash]
+patterns = ['mimo-v2\.6-flash']
+
+# Tiers: the profile name's prefix (basic-general -> basic). Same figures as profiles.md.
+# min_kv_gib is the VRAM left for the KV cache below which a quant is not proposed.
+[tiers.basic]
+vram_gb = 24
+price_hour = 0.34
+min_kv_gib = 5      # 64K of f16 KV on a hybrid 27B is ~4.3 GiB
+
+[tiers.medium]
+vram_gb = 48
+price_hour = 0.79
+min_kv_gib = 10     # 128K: ~8.5 GiB
+
+[tiers.big]
+vram_gb = 96
+price_hour = 1.69
+min_kv_gib = 12
+
+[tiers.huge]
+vram_gb = 141
+gpu_count = 4
+price_hour = 14.36
+min_kv_gib = 40
+
+# The study the live matrix came from (copied from the original comparison, 2026-10-21):
+# the judge gets it as the bar to beat, and candidates it already evaluated are flagged.
+# Replace or add files when a new study supersedes it.
+[baseline]
+files = ["baseline/profiles-v3.yaml", "baseline/INFORME-2026-10.md"]
+
+[judge]
+# Passed to `claude -p --model` when set (empty: Claude Code's default).
+model = ""
+timeout_minutes = 20
