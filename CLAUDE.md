@@ -43,12 +43,6 @@ Your PC ── ronin opencode ──► opencode ──HTTPS──► https://<p
 - `tests/` — `python -m unittest`.
 - `ronin/ui.py` — console formatting (colours, symbols, progress line).
 - `ronin/mascot.py` — ASCII mascot shown by some commands.
-- `scout/` — a standalone satellite (like `eval/`) that scans Hugging Face for new
-  abliterated models, fits them to the tiers, has `claude -p` judge them against the
-  baseline study in `scout/baseline/`, and writes `scout/reports/<date>.md` (committed).
-  It reads `ronin.toml` but never edits it or starts a pod. Config in `scout/watch.toml`.
-- `eval/` — a standalone harness that runs a set of prompt tasks against configured
-  model endpoints and scores the responses, to compare model variants on the same tasks.
 - `templates/` — vLLM chat templates.
 
 ## Conventions
