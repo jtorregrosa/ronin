@@ -502,8 +502,10 @@ def opencode_config(cfg: Config, state: dict) -> dict:
 
     opencode talks OpenAI-compatible `/v1/chat/completions` (via @ai-sdk/openai-compatible),
     which vLLM already serves on the same port as its Anthropic one -- so no proxy is needed
-    and the pod is unchanged. A custom provider needs its context limit and tool support
-    declared explicitly: opencode cannot autodetect them."""
+    and the pod is unchanged. A custom provider needs its context limit, tool support and
+    (text-only) input modality declared explicitly: opencode cannot autodetect them and
+    defaults an unknown model to text+image -- which would make it attach screenshots to a
+    text-only pod and brick the session on the first image (every resend then 400s)."""
     if not state.get("pod_id") or not state.get("api_key"):
         raise ConfigError("No pod is active\nRun `ronin up` first (or `ronin opencode --up`).")
     url = proxy_url(state["pod_id"], cfg.port)
@@ -523,9 +525,15 @@ def opencode_config(cfg: Config, state: dict) -> dict:
                 "models": {
                     name: {
                         "name": name,
-                        # agentic coding needs tool use; vLLM exposes it via
-                        # --enable-auto-tool-choice --tool-call-parser in the profile
-                        "tools": True,
+                        # Not in opencode's catalog, so opencode cannot autodetect these
+                        # and assumes text+image input + tool support. Declare them:
+                        #  - tools: agentic coding needs it (vLLM --enable-auto-tool-choice
+                        #    / llama.cpp --jinja in the profile expose the parser);
+                        #  - input TEXT ONLY: the pods serve text models (llama.cpp
+                        #    --no-mmproj, vLLM --limit-mm-per-prompt image=0), so without
+                        #    this opencode would attach screenshots the endpoint rejects and
+                        #    one image part then 400s on every resend, bricking the session.
+                        "capabilities": {"tools": True, "input": ["text"], "output": ["text"]},
                         "limit": {"context": context, "output": CLAUDE_MAX_OUTPUT},
                     },
                 },
