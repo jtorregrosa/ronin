@@ -82,7 +82,7 @@ while waiting); `--secure` uses the secure cloud instead of waiting.
 |---|---|
 | `ronin init` | Set up a project here: `ronin.toml`, `.env`, `.gitignore` entries (and the volume in volume mode) |
 | `ronin doctor` | Check config, API key, the agent on PATH, stock and whether each profile's model fits its GPUs; exit code 1 on problems |
-| `ronin gpus [--min-vram GB]` | Available GPUs, price/h and datacenters with stock |
+| `ronin gpus [--min-vram GB] [--secure]` | Available GPUs, price/h and datacenters with stock (`--secure` lists secure cloud instead of the configured one) |
 | `ronin profiles` | List the configured profiles (model, GPU, backend, context) |
 | `ronin volume [ls\|create\|rm ID [--yes]]` | Network volumes with size and monthly cost; create the configured one; delete one |
 | `ronin up [-p profile] [--max-hours H] [--idle M] [--secure] [--max-wait M] [--keep-on-failure] [--skip-memory-check]` | Check the model fits, create the pod (with the in-pod guard), wait until the server responds. With no stock on the configured cloud it **waits** for it (nothing billed; `--max-wait` caps it); `--secure` uses secure cloud instead of waiting |

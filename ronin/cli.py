@@ -313,11 +313,12 @@ def cmd_profiles(args, cfg: Config) -> None:
 
 
 def cmd_gpus(args, cfg: Config) -> None:
-    cloud = cfg.cloud.lower()
-    gpus = [g for g in client().list_gpus(cfg.cloud) if g.get("memory", 0) >= args.min_vram]
+    cloud_name = "SECURE" if args.secure else cfg.cloud
+    cloud = cloud_name.lower()
+    gpus = [g for g in client().list_gpus(cloud_name) if g.get("memory", 0) >= args.min_vram]
     gpus.sort(key=lambda g: (g.get("price", {}).get(cloud) or 0))
     if not gpus:
-        ui.warn(f"No GPUs with {args.min_vram} GB or more in {cfg.cloud}.")
+        ui.warn(f"No GPUs with {args.min_vram} GB or more in {cloud_name}.")
         return
 
     stock_color = {"HIGH": ui.green, "MEDIUM": ui.yellow, "LOW": ui.yellow}
@@ -329,7 +330,7 @@ def cmd_gpus(args, cfg: Config) -> None:
                      g.get("availability", "-"), dcs))
     w_id = max(len(r[0]) for r in rows)
 
-    print(f"  {ui.bold(f'GPUs with {args.min_vram} GB or more')} {ui.dim(f'· {cfg.cloud} cloud · price per hour')}\n")
+    print(f"  {ui.bold(f'GPUs with {args.min_vram} GB or more')} {ui.dim(f'· {cloud_name} cloud · price per hour')}\n")
     print("  " + ui.dim(f"{'GPU':<{w_id}}  {'VRAM':>6}  {'$/h':>6}  {'stock':<6}  datacenters"))
     for gpu_id, vram, price, stock, dcs in rows:
         color = stock_color.get(stock, ui.dim)
@@ -403,7 +404,8 @@ def cmd_up(args, cfg: Config) -> None:
             rp, cfg, candidates, clouds,
             lambda gpu, cloud: pod_body(cfg, profile, gpu, volume_id, api_key,
                                         deadline, idle_seconds, cloud=cloud),
-            max_wait=(args.max_wait or 0) * 60, on_wait=heartbeat)
+            max_wait=(args.max_wait or 0) * 60, on_wait=heartbeat,
+            poll=max(MIN_STOCK_POLL, args.poll) if args.poll else STOCK_POLL)
     finally:
         state = load_state()
         if state.pop("waiting", None):
@@ -512,6 +514,7 @@ def cmd_up(args, cfg: Config) -> None:
 
 
 STOCK_POLL = 30                  # seconds between stock checks while waiting for a GPU
+MIN_STOCK_POLL = 5               # floor for --poll, to avoid hammering RunPod's API
 
 
 # RunPod's wording when the GPU is out of stock (vs. a request it will never accept).
@@ -538,7 +541,8 @@ def waiting_text(w: dict) -> str:
 
 
 def create_with_stock(rp: RunPod, cfg: Config, candidates, clouds: list[str], make_body,
-                      max_wait: float = 0, sleep=time.sleep, on_wait=None):
+                      max_wait: float = 0, sleep=time.sleep, on_wait=None,
+                      poll: int = STOCK_POLL):
     """Create the pod on the first cloud × GPU with stock, in order. When every attempt
     fails for lack of stock, wait and try again -- nothing is billed while waiting --
     until `max_wait` seconds have passed (0 = until Ctrl+C). Returns (pod, candidate, cloud).
@@ -585,10 +589,10 @@ def create_with_stock(rp: RunPod, cfg: Config, candidates, clouds: list[str], ma
                 if "SECURE" not in clouds:
                     hint += " · `--secure` also tries secure cloud (pricier)"
                 ui.hint(f"Nothing is billed while waiting · {hint}")
-                progress = ui.Progress(f"Waiting for stock (checking every {STOCK_POLL} s)")
+                progress = ui.Progress(f"Waiting for stock (checking every {poll} s)")
             if on_wait:
                 on_wait()
-            for _ in range(STOCK_POLL):
+            for _ in range(poll):
                 progress.tick()
                 sleep(1)
     finally:
@@ -921,7 +925,8 @@ def ensure_pod_for_agent(args, cfg: Config) -> dict:
     if args.up and not state.get("pod_id"):
         cmd_up(argparse.Namespace(profile=args.profile, keep_on_failure=False,
                                   max_hours=None, idle=None, skip_memory_check=False,
-                                  secure=args.secure, max_wait=args.max_wait), cfg)
+                                  secure=args.secure, max_wait=args.max_wait,
+                                  poll=args.poll), cfg)
         print()
     return load_state()
 
@@ -990,7 +995,7 @@ LAUNCH_COMMANDS = ("opencode", "claude")    # verbs that forward trailing args t
 AGENT_FLAGS = ("--up", "--secure", "-h", "--help")   # ronin's own launch options without a value
 
 
-AGENT_VALUED = ("--profile", "--max-wait")           # ... and with one
+AGENT_VALUED = ("--profile", "--max-wait", "--poll")  # ... and with one
 
 
 def add_stock_options(p) -> None:
@@ -999,6 +1004,9 @@ def add_stock_options(p) -> None:
                         "(pricier) instead of waiting")
     p.add_argument("--max-wait", type=float, metavar="MINUTES",
                    help="give up after waiting this long for stock (default: wait until Ctrl+C)")
+    p.add_argument("--poll", type=int, metavar="SECONDS",
+                   help=f"seconds between stock attempts while waiting (default {STOCK_POLL}; "
+                        f"minimum {MIN_STOCK_POLL})")
 
 
 def split_agent_args(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -1052,6 +1060,8 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("gpus", help="list GPUs, price and datacenters with stock")
     p.add_argument("--min-vram", type=int, default=24, help="minimum VRAM in GB (default 24)")
+    p.add_argument("--secure", action="store_true",
+                   help="list secure cloud instead of the configured cloud")
     p.set_defaults(func=cmd_gpus)
 
     p = sub.add_parser("up", help="bring the pod up with vLLM and wait until it is ready")
