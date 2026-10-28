@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from . import USER_AGENT
+from . import catalog as gpu_table   # `catalog` is the provider's list below
 from .pod import serve_arg
 
 HF_API = "https://huggingface.co/api/models/{}?expand%5B%5D=safetensors"
@@ -27,7 +29,7 @@ DTYPE_BYTES = {"F64": 8, "I64": 8, "F32": 4, "BF16": 2, "F16": 2, "I16": 2,
 # Quantization vLLM applies while loading a 16/32-bit checkpoint: bytes per parameter.
 ONLINE_QUANT = {"fp8": 1, "bitsandbytes": 0.5}
 DEFAULT_UTILIZATION = 0.9        # vLLM's --gpu-memory-utilization default
-# RunPod lists VRAM in round "GB" that is slightly above the GiB CUDA reports
+# Providers list VRAM in round "GB" that is slightly above the GiB CUDA reports
 # ("96 GB" RTX PRO 6000 = 94.97 GiB, "80 GB" H100 = 79.2 GiB).
 VRAM_GIB_PER_GB = 0.99
 # Activations, CUDA graphs and non-PyTorch memory on top of the weights.
@@ -92,7 +94,7 @@ def precision(params: dict[str, int], profile) -> str:
 @dataclass
 class Fit:
     gpu: str
-    vram_gb: float | None   # None: the GPU is not in RunPod's catalog
+    vram_gb: float | None   # None: the GPU is in neither the provider's catalog nor ronin's table
     spare_gib: float | None  # room left for the KV cache (negative: does not fit)
 
     @property
@@ -107,13 +109,15 @@ class Fit:
 def fits(profile, weights: float, catalog: list[dict]) -> list[Fit]:
     """One Fit per GPU of the profile, in the profile's order. With gpu_count > 1 the
     weights are spread over that many cards (tensor parallelism), so the pooled VRAM is
-    what must hold them; vram_gb is reported per card."""
-    vram = {g["id"]: g.get("memory") for g in catalog}
+    what must hold them; vram_gb is reported per card. GPUs are matched whatever their
+    spelling (ronin's name or the provider's); ronin's table fills in what the provider
+    does not list right now."""
+    vram = {gpu_table.key(g["id"]): g.get("memory") for g in catalog}
     utilization = float(serve_arg(profile, "--gpu-memory-utilization") or DEFAULT_UTILIZATION)
     count = max(1, getattr(profile, "gpu_count", 1))
     result = []
     for gpu in profile.gpus:
-        gb = vram.get(gpu)
+        gb = vram.get(gpu_table.key(gpu)) or gpu_table.vram_gb(gpu)
         spare = None
         if gb:
             spare = gb * count * VRAM_GIB_PER_GB * utilization - weights - OVERHEAD_GIB
@@ -126,3 +130,63 @@ def too_small_hint(profile, params: dict[str, int]) -> str:
         return "Use a GPU with more memory (`ronin gpus`) or a smaller model."
     return ('Add "--quantization", "fp8_per_tensor" to the profile\'s vllm_args (about half '
             "the memory), use a quantized checkpoint, or a GPU with more memory (`ronin gpus`).")
+
+
+# --- download size (what `ronin prices` bills as transfer) ---
+
+HF_FILES = "https://huggingface.co/api/models/{}?blobs=true"
+GGUF_DEFAULT_QUANT = "Q4_K_M"    # what llama-server's -hf takes when the model names none
+
+
+@lru_cache(maxsize=None)
+def repo_files(repo: str, timeout: float = 10) -> tuple[tuple[str, int], ...]:
+    """(path, bytes) of every file in a Hugging Face repo. Raises LookupError."""
+    headers = {"User-Agent": USER_AGENT}
+    if os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+    url = HF_FILES.format(urllib.parse.quote(repo, safe="/"))
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=timeout) as resp:
+            info = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise LookupError(f"Hugging Face answered {e.code} for {repo}") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
+        raise LookupError(f"could not reach Hugging Face ({e})") from None
+    return tuple((s["rfilename"], s.get("size") or 0) for s in info.get("siblings", []))
+
+
+def download_files(profile, files) -> list[tuple[str, int]]:
+    """The files the profile's server downloads on boot, out of the repo's `files`."""
+    if getattr(profile, "backend", "vllm") != "llamacpp":
+        return [f for f in files if f[0].endswith(".safetensors")]
+    ggufs = [f for f in files if f[0].endswith(".gguf")]
+    if profile.hf_file:
+        chosen = [f for f in ggufs if f[0] == profile.hf_file]
+    else:
+        quant = profile.model.partition(":")[2] or GGUF_DEFAULT_QUANT
+        # the quant as a whole token of the name (Q4_K must not match Q4_K_M), every shard
+        tag = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(quant)}(?![A-Za-z0-9_])", re.IGNORECASE)
+        chosen = [f for f in ggufs if tag.search(f[0]) and not _aux_gguf(f[0])]
+    if "--no-mmproj" not in profile.llamacpp_args:
+        # llama-server also fetches the vision projector the repo ships, if any
+        mmproj = sorted((f for f in ggufs if _basename(f[0]).startswith("mmproj")), key=lambda f: f[1])
+        chosen += mmproj[:1]
+    return chosen
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1].lower()
+
+
+def _aux_gguf(path: str) -> bool:
+    return _basename(path).startswith(("mmproj", "mtp"))
+
+
+def download_gb(profile) -> float:
+    """GB (10^9 bytes, how hosts bill transfer) the profile downloads on each boot.
+    Raises LookupError when it cannot be known."""
+    files = download_files(profile, repo_files(profile.model.partition(":")[0]))
+    if not files:
+        raise LookupError(f"no matching weight files in {profile.model}")
+    return sum(size for _, size in files) / 1e9

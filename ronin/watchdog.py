@@ -7,10 +7,10 @@ import time
 
 from . import mascot, ui
 from .config import Config, ConfigError, load_state
-from .pod import DEAD_STATES, client, forget_own, session_cost, terminate_own
-from .runpod import RunPod, RunPodError
+from .api import ProviderError
+from .pod import DEAD_STATES, forget_own, pod_client, session_cost, terminate_own
 
-WATCHDOG_POLL = 60               # seconds between RunPod checks while guarding
+WATCHDOG_POLL = 60               # seconds between provider checks while guarding
 
 
 WATCHDOG_FINAL_POLL = 5          # tighter polling once the deadline is near
@@ -35,21 +35,21 @@ def cmd_watchdog(args, cfg: Config) -> None:
         ui.warn("No pod registered.")
         ui.hint("`ronin up` to start one.")
         return
-    rp = client()
+    rp = pod_client(state)
     pod_id = state["pod_id"]
 
     def fetch() -> dict | None:
         """The pod, or None if it is already gone (404)."""
         try:
             return rp.get_pod(pod_id)
-        except RunPodError as e:
+        except ProviderError as e:
             if e.status == 404:
                 return None
             raise
 
     pod = fetch()
     if pod is None:
-        ui.warn(f"Pod {pod_id} no longer exists on RunPod.")
+        ui.warn(f"Pod {pod_id} no longer exists on {rp.label}.")
         ui.hint("`ronin down` to clear the local state.")
         return
 
@@ -58,22 +58,22 @@ def cmd_watchdog(args, cfg: Config) -> None:
 
     frame = 0
     width = 0
-    last_poll = time.monotonic()  # monotonic time of the last successful RunPod check
+    last_poll = time.monotonic()  # monotonic time of the last successful provider check
     base_uptime = (pod.get("runtime") or {}).get("uptime") or 0  # uptime read then
-    unreachable = None            # error text while RunPod cannot be reached
+    unreachable = None            # error text while the provider cannot be reached
     try:
         while True:
             now = time.monotonic()
             est_uptime = base_uptime + now - last_poll
             remaining = limit - est_uptime
-            # Poll on the interval, or tightly once the deadline is close or RunPod failed.
+            # Poll on the interval, or tightly once the deadline is close or the provider failed.
             tight = remaining <= WATCHDOG_POLL or unreachable
             interval = WATCHDOG_FINAL_POLL if tight else poll
             polled = now - last_poll >= interval
             if polled:
                 try:
                     fresh = _wd_check(rp, pod_id, limit, width)
-                except RunPodError as e:
+                except ProviderError as e:
                     if not e.transient:
                         raise
                     # A network blip must not kill the guard: keep estimating and retry.
@@ -88,7 +88,7 @@ def cmd_watchdog(args, cfg: Config) -> None:
                     est_uptime = base_uptime
                     remaining = limit - est_uptime
 
-            width = _wd_render(frame, remaining, est_uptime, pod, width, polled, unreachable)
+            width = _wd_render(frame, remaining, est_uptime, pod, width, polled, unreachable, rp.label)
             frame += 1
             time.sleep(1)
     except KeyboardInterrupt:
@@ -96,12 +96,12 @@ def cmd_watchdog(args, cfg: Config) -> None:
         raise
 
 
-def _wd_check(rp: RunPod, pod_id: str, limit: float, width: int) -> dict | None:
+def _wd_check(rp, pod_id: str, limit: float, width: int) -> dict | None:
     """Poll the pod and act on it. Returns the pod, or None once there is nothing
     left to guard (gone, dead and deleted, or deleted at the limit)."""
     try:
         pod = rp.get_pod(pod_id)
-    except RunPodError as e:
+    except ProviderError as e:
         if e.status != 404:
             raise
         _wd_clear(width)
@@ -135,19 +135,19 @@ def _wd_clear(width: int) -> None:
 
 
 def _wd_render(frame: int, remaining: float, uptime: float, pod: dict, width: int,
-               polled: bool, unreachable: str | None) -> int:
+               polled: bool, unreachable: str | None, label: str = "RunPod") -> int:
     """Draw the live countdown line (TTY) or one plain line per check otherwise."""
     left = ui.duration(max(0, remaining))
     cost = pod.get("cost")
     spent = f" · ≈ ${cost * uptime / 3600:.2f} so far" if isinstance(cost, (int, float)) else ""
     if not ui.TTY:
         if polled and unreachable:
-            ui.warn(f"RunPod unreachable, retrying: {unreachable}")
+            ui.warn(f"{label} unreachable, retrying: {unreachable}")
         elif polled:
             ui.step(f"{left} before the pod is deleted (up {ui.duration(uptime)}{spent})")
         return 0
     spin = ui.FRAMES[frame % len(ui.FRAMES)]
-    note = " · RunPod unreachable, retrying" if unreachable else ""
+    note = f" · {label} unreachable, retrying" if unreachable else ""
     plain = f"  {spin} {left} left before deletion · up {ui.duration(uptime)}{spent}{note}"
     line = (f"  {ui.cyan(spin)} {ui.bold(left)} left before deletion "
             f"{ui.dim('· up ' + ui.duration(uptime) + spent)}{ui.yellow(note)}")

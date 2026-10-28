@@ -1,5 +1,5 @@
 # ronin configuration — profiles follow an internal model-comparison matrix (v3, 2026-10-21).
-# Secrets (RUNPOD_API_KEY, HF_TOKEN) live in .env, not here.
+# Secrets (RUNPOD_API_KEY, VAST_API_KEY, HF_TOKEN) live in .env, not here.
 #
 # Each profile is a tier (the GPU you can get) x use (general / coding / science).
 # Most tiers serve GGUF with llama.cpp (backend = "llamacpp"); the FP8 picks of medium
@@ -12,6 +12,8 @@
 
 [defaults]
 profile = "basic-general"
+# Where pods run: "runpod" or "vast" (vast.ai). `ronin up --provider vast` overrides it.
+provider = "runpod"
 # vLLM image (used only by the vLLM profiles below). Pinned.
 image = "vllm/vllm-openai:v0.32.0"
 # "ephemeral": weights downloaded on every `ronin up` (no fixed cost).
@@ -35,7 +37,8 @@ client = "opencode"
 max_hours = 8
 idle_minutes = 60
 
-# GPU ids are RunPod's (`ronin gpus` prints the exact strings and current stock).
+# GPU ids are RunPod's; ronin translates them for vast.ai (`ronin gpus` prints the
+# exact strings and current stock).
 # Tier -> GPU (profiles.yaml): basic = RTX 4090 24GB, medium = L40S 48GB,
 # big = RTX PRO 6000 96GB Blackwell, huge = 4x H200.
 

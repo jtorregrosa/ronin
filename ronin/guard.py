@@ -10,11 +10,15 @@ Environment (set by `ronin up`):
   RONIN_PORT           port the server listens on (its /metrics tells requests apart)
   RONIN_BUSY_METRICS   comma-separated gauges of in-flight work (default: vLLM's)
   RONIN_DONE_METRIC    counter that moves on every finished request (default: vLLM's)
-RunPod provides RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY in every pod.
+  RONIN_PROVIDER       "runpod" (default) or "vast": how the pod deletes itself
+  RONIN_TUNNEL         "1": open a Cloudflare quick tunnel to the port and log its HTTPS URL
+RunPod provides RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY in every pod; vast.ai
+provides CONTAINER_ID and an instance-scoped CONTAINER_API_KEY.
 """
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -24,12 +28,21 @@ import urllib.error
 import urllib.request
 
 CHECK_EVERY = 30
-# Tried in order: delete is what ronin wants; stop at least ends GPU billing.
-ACTIONS = (
-    ("DELETE", "https://api.runpod.io/v2/pods/{id}", None),
-    ("DELETE", "https://rest.runpod.io/v1/pods/{id}", None),
-    ("POST", "https://api.runpod.io/v2/pods/{id}/action", {"action": "stop"}),
-)
+# Per provider, tried in order: delete is what ronin wants; stop at least ends GPU
+# billing (a stopped vast.ai instance still bills its disk).
+ACTIONS = {
+    "runpod": (
+        ("DELETE", "https://api.runpod.io/v2/pods/{id}", None),
+        ("DELETE", "https://rest.runpod.io/v1/pods/{id}", None),
+        ("POST", "https://api.runpod.io/v2/pods/{id}/action", {"action": "stop"}),
+    ),
+    "vast": (
+        ("DELETE", "https://console.vast.ai/api/v0/instances/{id}/", None),
+        ("PUT", "https://console.vast.ai/api/v0/instances/{id}/", {"state": "stopped"}),
+    ),
+}
+CLOUDFLARED = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+TUNNEL_URL = re.compile(r"https://[a-z0-9-]+[.]trycloudflare[.]com")
 # Gauges of in-flight work and a counter that moves on every finished request. The
 # defaults are vLLM's; a non-vLLM backend (e.g. llama.cpp) passes its own names in the env.
 BUSY = tuple(m for m in os.environ.get(
@@ -82,12 +95,23 @@ def activity(port):
     return busy, finished
 
 
+def identity():
+    """(provider, pod id, pod-scoped API key) from the env the provider sets."""
+    provider = os.environ.get("RONIN_PROVIDER") or "runpod"
+    if provider == "vast":
+        # VAST_CONTAINERLABEL is "C.<id>": a fallback for the id
+        label = os.environ.get("VAST_CONTAINERLABEL", "")
+        pod_id = os.environ.get("CONTAINER_ID") or label.partition("C.")[2] or None
+        return provider, pod_id, os.environ.get("CONTAINER_API_KEY")
+    return provider, os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
+
+
 def delete_self():
-    pod_id, key = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
+    provider, pod_id, key = identity()
     if not pod_id or not key:
-        log("RUNPOD_POD_ID / RUNPOD_API_KEY missing: cannot delete the pod")
+        log(f"{provider}: the pod id / API key are missing from the env: cannot delete the pod")
         return False
-    for method, url, body in ACTIONS:
+    for method, url, body in ACTIONS.get(provider, ()):
         req = urllib.request.Request(
             url.format(id=pod_id), method=method,
             data=json.dumps(body).encode() if body else None,
@@ -125,6 +149,31 @@ def watch(deadline, idle, port):
         time.sleep(CHECK_EVERY)
 
 
+def tunnel(port):
+    """Download cloudflared and open a quick tunnel to the server: an HTTPS URL for a
+    provider that only publishes plain HTTP. Logs the URL (ronin reads it from the log)."""
+    path = "/tmp/cloudflared"
+    try:
+        if not os.path.exists(path):
+            req = urllib.request.Request(CLOUDFLARED, headers={"User-Agent": "ronin-guard"})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(path, "wb") as f:
+                f.write(resp.read())
+            os.chmod(path, 0o755)
+        proc = subprocess.Popen(
+            [path, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    except Exception as e:
+        log(f"tunnel unavailable: {e}")
+        return
+    announced = False
+    for line in proc.stdout:            # keep reading: a full pipe would stall cloudflared
+        match = TUNNEL_URL.search(line)
+        if match and not announced:
+            announced = True
+            log(f"tunnel {match.group(0)}")
+    log(f"tunnel closed (cloudflared exited with {proc.wait()})")
+
+
 def main():
     deadline = float(os.environ.get("RONIN_DEADLINE") or 0)
     idle = float(os.environ.get("RONIN_IDLE") or 0)
@@ -136,6 +185,8 @@ def main():
         parts.append(f"or after {int(idle // 60)} min idle")
     log(" ".join(parts) or "no limits set")
 
+    if os.environ.get("RONIN_TUNNEL") == "1":
+        threading.Thread(target=tunnel, args=(port,), daemon=True).start()
     child = subprocess.Popen(sys.argv[1:])
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, _f: child.send_signal(s))

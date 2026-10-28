@@ -1,5 +1,6 @@
-"""Pod plumbing shared by the commands: RunPod requests, the vLLM endpoint, the pod
-definition, log streaming and the client config that points the coding agent at the pod."""
+"""Pod plumbing shared by the commands: the provider client (RunPod or vast.ai), the
+model endpoint, the pod definition, log streaming and the client config that points the
+coding agent at the pod."""
 
 from __future__ import annotations
 
@@ -12,9 +13,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import USER_AGENT, config, ui
+from . import USER_AGENT, catalog, config, ui, vast
+from .api import ProviderError
 from .config import Config, ConfigError, load_state, require_env, save_state
-from .runpod import RunPod, RunPodError
+from .runpod import CONTAINER_DISK_PRICE_GB_MONTH, RunPod
+from .vast import Vast
 
 VOLUME_MOUNT = "/models"
 
@@ -28,13 +31,18 @@ GUARD_SOURCE = Path(__file__).with_name("guard.py")
 VOLUME_PRICE_GB_MONTH = 0.07     # RunPod network volume, $/GB/month (approximate)
 
 
+
+
+VOLUME_POD_DISK_GB = 30          # container disk of a pod whose weights live on the volume
+
+
 # Pod states where the container is no longer serving (it may still hold its disk).
 DEAD_STATES = ("TERMINATED", "EXITED", "ERROR")
 
 
 # State keys that describe the registered pod.
 POD_KEYS = ("pod_id", "api_key", "profile", "model", "deadline", "idle_minutes",
-            "created_at", "balance_at_up")
+            "created_at", "balance_at_up", "provider", "url")
 
 
 # Pods ronin created, newest last (state["history"]), so `ronin cost` can name the
@@ -67,6 +75,30 @@ def proxy_url(pod_id: str, port: int) -> str:
     return f"https://{pod_id}-{port}.proxy.runpod.net"
 
 
+def endpoint(pod: dict, port: int) -> str | None:
+    """The model server's URL for a pod as the provider returns it (None while vast.ai
+    has not published the port yet)."""
+    if pod.get("provider") == "vast":
+        return vast.endpoint(pod, port)
+    return proxy_url(pod["id"], port)
+
+
+def pod_url(cfg: Config, state: dict) -> str | None:
+    """The registered pod's URL: recorded by `up`, or RunPod's proxy for older states.
+    None while a vast.ai pod has not published its port yet."""
+    if state.get("url"):
+        return state["url"]
+    return proxy_url(state["pod_id"], cfg.port) if pod_provider(state) == "runpod" else None
+
+
+def require_url(cfg: Config, state: dict) -> str:
+    url = pod_url(cfg, state)
+    if not url:
+        raise ConfigError("The pod has no endpoint yet\n"
+                          "vast.ai publishes the port once the container runs: `ronin status`.")
+    return url
+
+
 def healthy(url: str, timeout: float = 10) -> bool:
     req = urllib.request.Request(url + "/health", headers={"User-Agent": USER_AGENT})
     try:
@@ -76,8 +108,23 @@ def healthy(url: str, timeout: float = 10) -> bool:
         return False
 
 
-def client() -> RunPod:
-    return RunPod(require_env("RUNPOD_API_KEY"))
+# Each provider's client and the .env variable holding its API key.
+PROVIDERS = {"runpod": (RunPod, "RUNPOD_API_KEY"), "vast": (Vast, "VAST_API_KEY")}
+
+
+def client(provider: str = "runpod") -> RunPod | Vast:
+    cls, key = PROVIDERS[provider]
+    return cls(require_env(key))
+
+
+def pod_provider(state: dict) -> str:
+    """The provider the registered pod runs on (RunPod for states written before ronin
+    knew other providers) -- never the configured one, which may differ."""
+    return state.get("provider") or "runpod"
+
+
+def pod_client(state: dict) -> RunPod | Vast:
+    return client(pod_provider(state))
 
 
 class LogStream:
@@ -90,11 +137,11 @@ class LogStream:
 
     DONE = object()
 
-    def __init__(self, rp: RunPod, pod_id: str, tail: int, reconnect: bool = False):
+    def __init__(self, rp, pod_id: str, tail: int, reconnect: bool = False):
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._run, args=(rp, pod_id, tail, reconnect), daemon=True).start()
 
-    def _run(self, rp: RunPod, pod_id: str, tail: int, reconnect: bool) -> None:
+    def _run(self, rp, pod_id: str, tail: int, reconnect: bool) -> None:
         while True:
             try:
                 for event in rp.stream_logs(pod_id, tail=tail):
@@ -128,12 +175,12 @@ class LogSnapshot:
     backfills them at once; the stream never ends by itself, so it is closed after
     `wait` seconds. Poll `done` / `lines` from the main thread (never blocks)."""
 
-    def __init__(self, rp: RunPod, pod_id: str, tail: int = 200, wait: float = 4.0):
+    def __init__(self, rp, pod_id: str, tail: int = 200, wait: float = 4.0):
         self.lines: list[str] = []
         self.done = False
         threading.Thread(target=self._run, args=(rp, pod_id, tail, wait), daemon=True).start()
 
-    def _run(self, rp: RunPod, pod_id: str, tail: int, wait: float) -> None:
+    def _run(self, rp, pod_id: str, tail: int, wait: float) -> None:
         resp = None
         try:
             resp = rp.open_logs(pod_id, tail)
@@ -153,14 +200,14 @@ class LogSnapshot:
             self.done = True
 
 
-def terminate(rp: RunPod, state: dict) -> str | None:
+def terminate(rp, state: dict) -> str | None:
     """Delete the registered pod and clear it from state. Returns its id."""
     pod_id = state.get("pod_id")
     if not pod_id:
         return None
     try:
         rp.delete_pod(pod_id)
-    except RunPodError as e:
+    except ProviderError as e:
         if e.status != 404:
             raise
     for entry in state.get("history", []):
@@ -170,7 +217,7 @@ def terminate(rp: RunPod, state: dict) -> str | None:
     return pod_id
 
 
-def terminate_own(rp: RunPod, pod_id: str) -> None:
+def terminate_own(rp, pod_id: str) -> None:
     """Delete `pod_id` -- the pod this long-running process (`up`, `watchdog`) created or
     guards -- re-reading the state first. Its in-memory copy may be old: if `ronin down`
     and a new `up` ran meanwhile, saving it would unregister the new pod, which would then
@@ -181,7 +228,7 @@ def terminate_own(rp: RunPod, pod_id: str) -> None:
         return
     try:
         rp.delete_pod(pod_id)
-    except RunPodError as e:
+    except ProviderError as e:
         if e.status != 404:
             raise
     marked = False
@@ -200,10 +247,29 @@ def forget_own(pod_id: str) -> None:
         clear_pod(state)
 
 
-def remember_pod(state: dict, pod: dict, profile_name: str) -> None:
+def orphans(state: dict) -> list[tuple[object, dict]]:
+    """Pods named ronin-* on any provider with a key set that are not this project's
+    registered pod: (client, pod). They bill unseen -- a crashed `up`, or another
+    project's pod. Providers that cannot be reached are skipped."""
+    found = []
+    for provider, (_, key) in PROVIDERS.items():
+        if not os.environ.get(key):
+            continue
+        rp = client(provider)
+        own = state.get("pod_id") if pod_provider(state) == provider else None
+        try:
+            pods = rp.list_pods()
+        except ProviderError:
+            continue
+        found += [(rp, p) for p in pods
+                  if str(p.get("name") or "").startswith("ronin-") and str(p["id"]) != own]
+    return found
+
+
+def remember_pod(state: dict, pod: dict, profile_name: str, provider: str = "runpod") -> None:
     """Add a just-created pod to the history (saved with the next save_state)."""
     history = state.setdefault("history", [])
-    history.append({"pod_id": pod["id"], "profile": profile_name,
+    history.append({"pod_id": pod["id"], "profile": profile_name, "provider": provider,
                     "gpu": (pod.get("gpu") or {}).get("id"),
                     "cost_per_hour": pod.get("cost"), "created_at": time.time()})
     del history[:-HISTORY_MAX]
@@ -244,7 +310,7 @@ def guard_text(state: dict) -> str | None:
 def session_cost(pod: dict, since: float | None = None) -> str | None:
     """'1h 12m · ≈ $1.31 (estimate)' from the hourly cost and the time billed so far.
 
-    RunPod bills from the pod's creation, so `since` (the creation time ronin recorded)
+    Providers bill from the pod's creation, so `since` (the creation time ronin recorded)
     is used when known; the container's uptime leaves out the image pull and the model
     download, and under-counts. Either way it is an estimate: see `ronin cost`."""
     seconds = time.time() - since if since else (pod.get("runtime") or {}).get("uptime")
@@ -257,17 +323,20 @@ def session_cost(pod: dict, since: float | None = None) -> str | None:
     return text
 
 
-def real_session_cost(rp: RunPod, state: dict) -> float | None:
+def real_session_cost(rp, state: dict) -> float | None:
     """Money the account lost since `ronin up` (balance then minus balance now): the
     real figure, available at once -- billing per pod is only published ~1 h later.
-    It includes anything else billing on the account meanwhile (other pods, volumes)."""
+    It includes anything else billing on the account meanwhile (other pods, volumes), and
+    lags behind: the balance is debited in batches. None when unknown -- also when the
+    balance grew (a top-up meanwhile), which would otherwise read as $0.00."""
     before = state.get("balance_at_up")
     if before is None:
         return None
     try:
-        return max(0.0, before - rp.account()["balance"])
-    except RunPodError:
+        spent = before - rp.account()["balance"]
+    except ProviderError:
         return None
+    return spent if spent >= 0 else None
 
 
 def ensure_volume(rp: RunPod, cfg: Config, state: dict) -> str:
@@ -409,23 +478,38 @@ def _guard_wrap(backend: str, entrypoint: list[str], env: dict) -> list[str]:
 BACKENDS = {"vllm": _vllm_spec, "llamacpp": _llamacpp_spec}
 
 
-def pod_body(cfg: Config, profile, gpu_id: str, volume_id: str | None, api_key: str,
-             deadline: float = 0, idle_seconds: float = 0, cloud: str | None = None) -> dict:
+def server_spec(cfg: Config, profile, volume_id: str | None, api_key: str,
+                deadline: float = 0, idle_seconds: float = 0, guard_env: dict | None = None):
+    """(env, entrypoint, cmd, image) of the model server, whatever the provider. With a
+    deadline, an idle limit or `guard_env` (provider settings for the guard), the server
+    runs under the in-pod guard."""
     backend = getattr(profile, "backend", "vllm")
     env, entrypoint, cmd, image = BACKENDS[backend](cfg, profile, volume_id, api_key)
     if os.environ.get("HF_TOKEN"):
         env["HF_TOKEN"] = os.environ["HF_TOKEN"]
-    if deadline or idle_seconds:
+    if deadline or idle_seconds or guard_env:
         # the guard wraps the server and deletes the pod from inside (see guard.py)
         env.update(RONIN_DEADLINE=str(int(deadline)), RONIN_IDLE=str(int(idle_seconds)),
                    RONIN_PORT=str(cfg.port))
         env.update(GUARD_METRICS.get(backend, {}))
+        env.update(guard_env or {})
         entrypoint = _guard_wrap(backend, entrypoint, env)
-    gpu = {"id": gpu_id, "count": profile.gpu_count}
-    min_cuda = getattr(profile, "min_cuda", None) or BACKEND_MIN_CUDA.get(backend)
-    if min_cuda:
+    return env, entrypoint, cmd, image
+
+
+def min_cuda(profile) -> str | None:
+    return getattr(profile, "min_cuda", None) or BACKEND_MIN_CUDA.get(getattr(profile, "backend", "vllm"))
+
+
+def pod_body(cfg: Config, profile, gpu_id: str, volume_id: str | None, api_key: str,
+             deadline: float = 0, idle_seconds: float = 0, cloud: str | None = None) -> dict:
+    """The RunPod pod definition (POST /pods)."""
+    env, entrypoint, cmd, image = server_spec(cfg, profile, volume_id, api_key, deadline, idle_seconds)
+    gpu = {"id": catalog.provider_gpu(gpu_id, "runpod"), "count": profile.gpu_count}
+    cuda = min_cuda(profile)
+    if cuda:
         # only hosts whose driver supports this CUDA version (RunPod filters on create)
-        gpu["minCudaVersion"] = min_cuda
+        gpu["minCudaVersion"] = cuda
     body = {
         "name": f"ronin-{profile.name}",
         "image": image,
@@ -433,7 +517,7 @@ def pod_body(cfg: Config, profile, gpu_id: str, volume_id: str | None, api_key: 
         "gpu": gpu,
         # with a volume the pod must go to its datacenter; in ephemeral only if one is set
         "dataCenterIds": [cfg.datacenter] if cfg.datacenter else [],
-        "disk": 30 if volume_id else profile.disk_gb,
+        "disk": VOLUME_POD_DISK_GB if volume_id else profile.disk_gb,
         "ports": [f"{cfg.port}/http"],
         "env": env,
         "entrypoint": entrypoint,
@@ -442,6 +526,65 @@ def pod_body(cfg: Config, profile, gpu_id: str, volume_id: str | None, api_key: 
     if volume_id:
         body["mounts"] = {"network": [{"volumeId": volume_id, "path": VOLUME_MOUNT}]}
     return body
+
+
+# The guard settings of a vast.ai pod: how to delete itself, and an HTTPS tunnel, since
+# vast.ai publishes the model port as plain HTTP on the host's IP (see guard.py).
+VAST_GUARD_ENV = {"RONIN_PROVIDER": "vast", "RONIN_TUNNEL": "1"}
+
+
+def vast_offer(cfg: Config, profile, gpu: str, cloud: str | None = None) -> dict:
+    """The vast.ai offer search filters for `profile` on `gpu`: what `up` would rent and
+    what `prices` quotes. Raises ConfigError for a GPU vast.ai has no name for."""
+    name = catalog.provider_gpu(gpu, "vast")
+    row = catalog.find(gpu)
+    count = profile.gpu_count
+    offer = {
+        **catalog.VAST_BASE_FILTERS,
+        **catalog.VAST_CLOUDS[cloud or cfg.cloud],
+        "gpu_name": {"eq": name},
+        "num_gpus": {"eq": count},
+        "disk_space": {"gte": profile.disk_gb},
+        # the same name covers several memory sizes on vast (A100 40/80 GB): MiB per card
+        "gpu_ram": {"gte": catalog.min_ram_mib(row)},
+    }
+    if row.vast_max_dph:
+        offer["dph_base"] = {"lte": row.vast_max_dph * count}
+    cuda = min_cuda(profile)
+    if cuda:
+        offer["cuda_max_good"] = {"gte": float(cuda)}
+    return offer
+
+
+def vast_body(cfg: Config, profile, gpu: str, api_key: str, deadline: float = 0,
+              idle_seconds: float = 0, cloud: str | None = None) -> dict:
+    """What vast.ai's client rents: {'offer': search filters, 'instance': PUT /asks body}.
+    The guard always runs on vast.ai, for its tunnel even without limits."""
+    offer = vast_offer(cfg, profile, gpu, cloud)
+    env, entrypoint, cmd, image = server_spec(cfg, profile, None, api_key, deadline,
+                                              idle_seconds, guard_env=dict(VAST_GUARD_ENV))
+    instance = {
+        "image": image,
+        "disk": profile.disk_gb,
+        # "args": the container runs as is (no ssh/jupyter injected), with this entrypoint
+        "runtype": "args",
+        "entrypoint": entrypoint[0],
+        "args": [*entrypoint[1:], *cmd],
+        # docker options go in env: publish the model port
+        "env": {**env, f"-p {cfg.port}:{cfg.port}": "1"},
+        "label": f"ronin-{profile.name}",
+        # fail instead of leaving a stopped instance (billing storage) when the host is busy
+        "cancel_unavail": True,
+    }
+    return {"offer": offer, "instance": instance}
+
+
+def make_body(provider: str):
+    """The pod-definition builder of a provider (same arguments for both)."""
+    if provider == "vast":
+        return lambda cfg, profile, gpu, volume_id, api_key, deadline, idle, cloud: \
+            vast_body(cfg, profile, gpu, api_key, deadline, idle, cloud)
+    return pod_body
 
 
 CLAUDE_MAX_OUTPUT = 16384       # default 32000 for unrecognised models: eats too much context
@@ -508,7 +651,7 @@ def opencode_config(cfg: Config, state: dict) -> dict:
     text-only pod and brick the session on the first image (every resend then 400s)."""
     if not state.get("pod_id") or not state.get("api_key"):
         raise ConfigError("No pod is active\nRun `ronin up` first (or `ronin opencode --up`).")
-    url = proxy_url(state["pod_id"], cfg.port)
+    url = require_url(cfg, state)
     context = max_model_len(cfg.profiles.get(state.get("profile", "")))
     name = cfg.served_name
     return {
@@ -545,7 +688,7 @@ def opencode_config(cfg: Config, state: dict) -> dict:
 def claude_env(cfg: Config, state: dict) -> dict[str, str]:
     if not state.get("pod_id") or not state.get("api_key"):
         raise ConfigError("No pod is active\nRun `ronin up` first (or `ronin claude --up`).")
-    url = proxy_url(state["pod_id"], cfg.port)
+    url = require_url(cfg, state)
     context = max_model_len(cfg.profiles.get(state.get("profile", "")))
     # Claude Code does not know "ronin" and would assume 200K of context: tell it the
     # real value and compact with headroom for output (the minimum allowed is 100000).
@@ -573,19 +716,20 @@ def claude_env(cfg: Config, state: dict) -> dict[str, str]:
 
 
 def pod_problem(cfg: Config, state: dict) -> str | None:
-    """Why the registered pod cannot serve Claude Code, or None if vLLM answers.
+    """Why the registered pod cannot serve the agent, or None if the model server answers.
     A pod that no longer exists (or is dead and then deleted) is reported as 'gone…'."""
-    if healthy(proxy_url(state["pod_id"], cfg.port), timeout=5):
+    url = pod_url(cfg, state)
+    if url and healthy(url, timeout=5):
         return None
-    rp = client()
+    rp = pod_client(state)
     try:
         pod = rp.get_pod(state["pod_id"])
-    except RunPodError as e:
+    except ProviderError as e:
         if e.status != 404:
             raise
         clear_pod(state)
-        return "gone (it no longer exists on RunPod; the guard may have deleted it)"
+        return f"gone (it no longer exists on {rp.label}; the guard may have deleted it)"
     if pod["status"] in DEAD_STATES:
         terminate(rp, state)
         return f"gone (it was {pod['status']}; deleted)"
-    return f"{pod['status']} but vLLM is not responding yet"
+    return f"{pod['status']} but the model server is not responding yet"

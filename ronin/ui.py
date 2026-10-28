@@ -50,6 +50,7 @@ COLOR = TTY and not os.environ.get("NO_COLOR") and _enable_vt()
 _UNICODE = _encodable("›✓✗…⠋")
 SYM = ({"step": "›", "ok": "✓", "warn": "!", "err": "✗", "dots": "…"} if _UNICODE
        else {"step": ">", "ok": "+", "warn": "!", "err": "x", "dots": "..."})
+SYM["pick"] = "→" if _encodable("→") else ">"
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" if _UNICODE else "|/-\\"
 
 

@@ -3,91 +3,37 @@ account reads it lacks: the balance (GraphQL) and per-pod billing (REST v1)."""
 
 from __future__ import annotations
 
-import http.client
 import json
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Iterator
 
-from . import USER_AGENT
+from .api import JsonClient, ProviderError
 
 BASE_URL = "https://api.runpod.io/v2"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 BILLING_URL = "https://rest.runpod.io/v1/billing/pods"
 
 
-RETRIES = 3                  # extra attempts for idempotent requests on transient errors
-RETRY_BACKOFF = 2.0          # seconds; doubles on each attempt
+# RunPod's wording when the GPU is out of stock (vs. a request it will never accept).
+NO_STOCK = ("no longer any instances available", "no instances available",
+            "out of stock", "insufficient capacity")
+
+CONTAINER_DISK_PRICE_GB_MONTH = 0.10   # container disk while running, $/GB/month
+HOURS_PER_MONTH = 30 * 24
 
 
-class RunPodError(Exception):
-    def __init__(self, status: int, detail: str):
-        super().__init__(f"RunPod {status}: {detail}")
-        self.status = status
-        self.detail = detail
+class RunPodError(ProviderError):
+    provider = "RunPod"
 
     @property
-    def transient(self) -> bool:
-        """Network failure (0), rate limit or server error: worth retrying."""
-        return self.status in (0, 408, 429) or self.status >= 500
+    def no_stock(self) -> bool:
+        return any(s in (self.detail or "").lower() for s in NO_STOCK)
 
 
-class RunPod:
-    def __init__(self, api_key: str, timeout: float = 30):
-        self.api_key = api_key
-        self.timeout = timeout
-
-    def _request(self, method: str, path: str, body: dict | None = None,
-                 query: dict | None = None, stream: bool = False,
-                 timeout: float | None = None, idempotent: bool | None = None):
-        # Only idempotent requests are retried: a repeated POST could create two pods.
-        if idempotent is None:
-            idempotent = method in ("GET", "DELETE")
-        attempts = 1 + (RETRIES if idempotent else 0)
-        for attempt in range(attempts):
-            try:
-                return self._send(method, path, body, query, stream, timeout)
-            except RunPodError as e:
-                if not e.transient or attempt == attempts - 1:
-                    raise
-                time.sleep(RETRY_BACKOFF * 2 ** attempt)
-
-    def _send(self, method: str, path: str, body: dict | None, query: dict | None,
-              stream: bool, timeout: float | None):
-        url = path if path.startswith("https://") else BASE_URL + path
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-            "Accept": "text/event-stream" if stream else "application/json",
-        })
-        try:
-            resp = urllib.request.urlopen(req, timeout=None if stream else timeout or self.timeout)
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode(errors="replace")
-            try:
-                problem = json.loads(raw)
-                detail = problem.get("detail") or problem.get("title") or raw
-            except json.JSONDecodeError:
-                detail = raw or e.reason
-            raise RunPodError(e.code, detail) from None
-        except urllib.error.URLError as e:
-            raise RunPodError(0, f"could not reach RunPod: {e.reason}") from None
-        except (TimeoutError, ConnectionError) as e:
-            raise RunPodError(0, f"could not reach RunPod: {e}") from None
-        if stream:
-            return resp
-        try:
-            with resp:
-                raw = resp.read()
-        except (OSError, http.client.HTTPException) as e:
-            raise RunPodError(0, f"connection to RunPod dropped: {e}") from None
-        return json.loads(raw) if raw else {}
+class RunPod(JsonClient):
+    BASE_URL = BASE_URL
+    name = "runpod"
+    label = "RunPod"
+    error = RunPodError
 
     # --- account ---
 
@@ -132,10 +78,14 @@ class RunPod:
     # --- pods ---
 
     def create_pod(self, body: dict) -> dict:
-        return self._request("POST", "/pods", body)
+        return with_disk_cost(self._request("POST", "/pods", body))
 
     def get_pod(self, pod_id: str, timeout: float | None = None) -> dict:
-        return self._request("GET", f"/pods/{pod_id}", timeout=timeout)
+        return with_disk_cost(self._request("GET", f"/pods/{pod_id}", timeout=timeout))
+
+    def list_pods(self) -> list[dict]:
+        """Every pod of the account (with its 'name')."""
+        return [with_disk_cost(p) for p in self._request("GET", "/pods").get("pods") or []]
 
     def delete_pod(self, pod_id: str) -> None:
         self._request("DELETE", f"/pods/{pod_id}")
@@ -155,3 +105,14 @@ class RunPod:
                         yield json.loads(line[5:].strip())
                     except json.JSONDecodeError:
                         continue
+
+
+def with_disk_cost(pod: dict) -> dict:
+    """RunPod's 'cost' is the GPU's $/h alone; the container disk bills on top (what the
+    account's spend per hour shows). 'cost' becomes the total, like vast.ai's, and the
+    GPU's part is kept in 'gpu_cost'."""
+    cost, disk = pod.get("cost"), pod.get("disk") or pod.get("containerDiskInGb") or 0
+    if isinstance(cost, (int, float)) and "gpu_cost" not in pod:
+        pod["gpu_cost"] = cost
+        pod["cost"] = round(cost + disk * CONTAINER_DISK_PRICE_GB_MONTH / HOURS_PER_MONTH, 4)
+    return pod

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ronin import cli, config, fit, guard, pod, runpod, watchdog
+from ronin import api, catalog, cli, config, fit, guard, pod, runpod, vast, watchdog
 
 pod_mod = pod   # `pod` is also a common local name in tests
 from ronin.config import ConfigError
@@ -36,6 +36,12 @@ class ProjectTestCase(unittest.TestCase):
         (self.root / "ronin.toml").write_text(self.toml, encoding="utf-8")
         self.previous = config.project
         config.use_project(str(self.root / "ronin.toml"))
+        # no real provider keys: nothing (the orphan check, say) may reach a live API
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("RUNPOD_API_KEY", "VAST_API_KEY"):
+            os.environ.pop(key, None)
 
     def tearDown(self):
         config.project = self.previous
@@ -313,7 +319,7 @@ llamacpp_args = ["-c", "65536", "-ngl", "99", "-ctk", "q8_0"]
 
 class Retries(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.object(runpod.time, "sleep")
+        patcher = mock.patch.object(api.time, "sleep")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -341,6 +347,8 @@ class Retries(unittest.TestCase):
 
 
 class FakeRunPod:
+    name, label = "runpod", "RunPod"
+
     def __init__(self, pod=None, error=None):
         self.pod, self.error, self.deleted = pod, error, []
 
@@ -540,6 +548,28 @@ class Costs(ProjectTestCase):
         rp = mock.Mock(account=mock.Mock(return_value={"balance": 14.66, "spend_per_hour": 0}))
         self.assertAlmostEqual(pod_mod.real_session_cost(rp, {"balance_at_up": 14.82}), 0.16)
         self.assertIsNone(pod_mod.real_session_cost(rp, {}))      # no balance recorded
+        # a top-up meanwhile: unknown, not $0.00
+        self.assertIsNone(pod_mod.real_session_cost(rp, {"balance_at_up": 10.0}))
+
+    def down_text(self, session, real, estimate):
+        with mock.patch.dict(cli.os.environ, {"NO_COLOR": "1"}):
+            return "\n".join(cli.down_cost_lines(session, real, estimate, "RunPod"))
+
+    def test_down_shows_the_real_cost_once_debited(self):
+        text = self.down_text("27m · ≈ $0.79 (estimate)", 0.78, 0.79)
+        self.assertIn("Real cost: $0.78", text)
+
+    def test_down_never_reports_an_undebited_session_as_free(self):
+        # RunPod debits in batches: 6 minutes in, nothing has left the balance yet
+        text = self.down_text("6m · ≈ $0.16 (estimate)", 0.0, 0.16)
+        self.assertNotIn("$0.00", text)
+        self.assertIn("≈ $0.16", text)
+        self.assertIn("has not debited it yet", text)
+        text = self.down_text(None, 0.14, 0.31)    # pod already gone: the estimate from history
+        self.assertIn("Session: ≈ $0.31", text)
+        self.assertIn("has debited $0.14 of it so far", text)
+        self.assertNotIn("Real cost", text)
+        self.assertNotIn("$0.00", self.down_text(None, 0.0, None))
 
     def test_history_survives_the_pod_and_marks_deletion(self):
         state = {}
@@ -575,6 +605,33 @@ class Costs(ProjectTestCase):
         self.assertAlmostEqual(pods["a"]["amount"], 1.2)
         self.assertAlmostEqual(pods["a"]["minutes"], 65)
         self.assertEqual(pods["a"]["first"], "2026-10-21 04:00:00")
+
+
+class UpCosts(unittest.TestCase):
+    """The $/h `up`, `status` and the estimates use is what the pod really bills."""
+
+    def test_runpod_cost_includes_the_container_disk(self):
+        # seen live: a $1.69/h GPU with 200 GB of disk -> the account spends $1.718/h
+        pod = runpod.with_disk_cost({"cost": 1.69, "disk": 200})
+        self.assertAlmostEqual(pod["cost"], 1.7178, places=4)
+        self.assertEqual(pod["gpu_cost"], 1.69)
+        self.assertEqual(runpod.with_disk_cost(pod)["cost"], pod["cost"])   # not added twice
+
+    def test_hourly_text_breaks_the_price_down(self):
+        with mock.patch.dict(cli.os.environ, {"NO_COLOR": "1"}):
+            text = cli.hourly_text({"cost": 1.7178, "gpu_cost": 1.69})
+        self.assertIn("$1.72/h", text)
+        self.assertIn("GPU $1.69 + disk $0.03", text)
+        self.assertEqual(cli.hourly_text({}), "$?/h")
+
+    def test_download_is_priced_on_vast_only(self):
+        profile = mock.Mock()
+        self.assertIsNone(cli.download_text({"cost": 1.0}, profile))     # RunPod: free
+        with mock.patch.object(cli.fit, "download_gb", return_value=120.0):
+            text = cli.download_text({"download_cost_per_gb": 0.01}, profile)
+        self.assertIn("≈ $1.20 once", text)
+        with mock.patch.object(cli.fit, "download_gb", side_effect=LookupError("x")):
+            self.assertIn("$10.00/TB", cli.download_text({"download_cost_per_gb": 0.01}, profile))
 
 
 class Snapshot(unittest.TestCase):
@@ -692,5 +749,634 @@ class MemoryFit(unittest.TestCase):
             self.assertEqual([f.gpu for f in cli.memory_check(rp, mock.Mock(cloud="SECURE"), p)], p.gpus)
 
 
+class GpuTable(unittest.TestCase):
+    def test_every_spelling_has_one_key(self):
+        for name in ("RTX 4090", "NVIDIA GeForce RTX 4090", "rtx 4090"):
+            self.assertEqual(catalog.key(name), "RTX 4090")
+        self.assertEqual(catalog.key("RTX PRO 6000 S"), "RTX PRO 6000 Server")
+        self.assertEqual(catalog.key("Some new GPU"), "Some new GPU")
+
+    def test_runpod_gets_its_id_or_the_name_untouched(self):
+        self.assertEqual(catalog.provider_gpu("L40S", "runpod"), "NVIDIA L40S")
+        self.assertEqual(catalog.provider_gpu("NVIDIA L40S", "runpod"), "NVIDIA L40S")
+        self.assertEqual(catalog.provider_gpu("NVIDIA B300", "runpod"), "NVIDIA B300")
+
+    def test_vast_never_gets_a_guessed_name(self):
+        self.assertEqual(catalog.provider_gpu("NVIDIA GeForce RTX 4090", "vast"), "RTX 4090")
+        with self.assertRaises(ConfigError):
+            catalog.provider_gpu("NVIDIA B300", "vast")
+
+    def test_repo_profiles_are_in_the_table(self):
+        # every GPU of the shipped ronin.toml can be rented on both providers
+        cfg = config.load_config(config.SOURCE_ROOT / "ronin.toml")
+        for p in cfg.profiles.values():
+            for gpu in p.gpus:
+                row = catalog.find(gpu)
+                self.assertIsNotNone(row, gpu)
+                self.assertTrue(row.runpod and row.vast and row.vast_max_dph, gpu)
+
+
+class ProviderConfig(ProjectTestCase):
+    def write(self, extra):
+        (self.root / "ronin.toml").write_text(MINIMAL.replace('[defaults]\n', '[defaults]\n' + extra),
+                                              encoding="utf-8")
+
+    def test_default_is_runpod(self):
+        self.assertEqual(config.load_config().provider, "runpod")
+
+    def test_vast(self):
+        self.write('provider = "vast"\n')
+        text = (self.root / "ronin.toml").read_text(encoding="utf-8")
+        (self.root / "ronin.toml").write_text(text.replace('"GPU A", "GPU B"', '"RTX 4090", "L40S"'),
+                                              encoding="utf-8")
+        self.assertEqual(config.load_config().provider, "vast")
+
+    def test_unknown_provider(self):
+        self.write('provider = "lambda"\n')
+        with self.assertRaises(ConfigError):
+            config.load_config()
+
+    def test_vast_has_no_volumes(self):
+        self.write('provider = "vast"\nstorage = "volume"\n')
+        with self.assertRaises(ConfigError):
+            config.load_config()
+
+
+class VastBody(ProjectTestCase):
+    toml = MINIMAL.replace('gpus = ["GPU A", "GPU B"]', 'gpus = ["NVIDIA GeForce RTX 4090", "L40S"]')
+
+    def body(self, gpu="NVIDIA GeForce RTX 4090", cloud="COMMUNITY", **kw):
+        cfg = config.load_config()
+        return pod.vast_body(cfg, cfg.profile(None), gpu, "secret", cloud=cloud, **kw)
+
+    def test_offer_filters(self):
+        offer = self.body()["offer"]
+        self.assertEqual(offer["gpu_name"], {"eq": "RTX 4090"})
+        self.assertEqual(offer["num_gpus"], {"eq": 1})
+        self.assertEqual(offer["verified"], {"eq": True})
+        self.assertEqual(offer["dph_base"], {"lte": catalog.find("RTX 4090").vast_max_dph})
+        self.assertGreater(offer["gpu_ram"]["gte"], 20000)        # MiB: a 24 GB card
+        self.assertNotIn("hosting_type", offer)
+        self.assertNotIn("cuda_max_good", offer)                   # vLLM: unfiltered
+        self.assertEqual(self.body(cloud="SECURE")["offer"]["hosting_type"], {"eq": 1})
+
+    def test_server_runs_under_the_guard_with_the_port_published(self):
+        inst = self.body()["instance"]
+        self.assertEqual(inst["runtype"], "args")
+        self.assertEqual(inst["entrypoint"], "python3")
+        self.assertEqual(inst["args"][0], "-c")
+        self.assertIn("def main", inst["args"][1])
+        self.assertEqual(inst["args"][2:4], ["vllm", "serve"])
+        self.assertEqual(inst["env"]["-p 8000:8000"], "1")
+        self.assertEqual(inst["env"]["RONIN_PROVIDER"], "vast")
+        self.assertEqual(inst["env"]["RONIN_TUNNEL"], "1")
+        self.assertEqual(inst["env"]["VLLM_API_KEY"], "secret")
+        self.assertNotIn("secret", inst["args"])
+        self.assertEqual(inst["label"], "ronin-main")
+        self.assertTrue(inst["cancel_unavail"])
+
+    def test_limits_reach_the_guard(self):
+        env = self.body(deadline=1_900_000_000, idle_seconds=600)["instance"]["env"]
+        self.assertEqual((env["RONIN_DEADLINE"], env["RONIN_IDLE"]), ("1900000000", "600"))
+
+    def test_multi_gpu_caps_the_whole_offer(self):
+        cfg = config.load_config()
+        p = config.Profile("tp", "org/m", ["L40S"], [], gpu_count=2)
+        offer = pod.vast_body(cfg, p, "L40S", "k", cloud="COMMUNITY")["offer"]
+        self.assertEqual(offer["num_gpus"], {"eq": 2})
+        self.assertEqual(offer["dph_base"], {"lte": catalog.find("L40S").vast_max_dph * 2})
+
+    def test_llamacpp_needs_cuda_12_8(self):
+        cfg = config.load_config()
+        p = config.Profile("gg", "o/m-GGUF:Q4_K_M", ["RTX 4090"], [], backend="llamacpp")
+        body = pod.vast_body(cfg, p, "RTX 4090", "k", cloud="COMMUNITY")
+        self.assertEqual(body["offer"]["cuda_max_good"], {"gte": 12.8})
+        self.assertEqual(body["instance"]["entrypoint"], "sh")
+
+    def test_unknown_gpu_is_refused(self):
+        with self.assertRaises(ConfigError):
+            self.body(gpu="GPU nobody knows")
+
+    def test_runpod_body_translates_short_names(self):
+        cfg = config.load_config()
+        body = pod.pod_body(cfg, cfg.profile(None), "L40S", None, "k")
+        self.assertEqual(body["gpu"]["id"], "NVIDIA L40S")
+        self.assertNotIn("RONIN_PROVIDER", body["env"])
+
+
+class VastClient(unittest.TestCase):
+    INSTANCE = {"id": 42, "actual_status": "running", "dph_total": 0.5, "gpu_name": "RTX 4090",
+                "public_ipaddr": "1.2.3.4\n", "start_date": 1_000_000.0,
+                "ports": {"8000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "33526"}]}}
+    OFFER = {"id": 7, "gpu_name": "RTX 4090", "dph_base": 0.40, "storage_cost": 0.36,
+             "geolocation": "Norway, NO", "inet_down_cost": 0.01}
+
+    def test_instance_in_runpod_shape(self):
+        with mock.patch.object(vast.time, "time", return_value=1_000_060.0):
+            p = vast.normalize(self.INSTANCE)
+        self.assertEqual((p["id"], p["status"], p["cost"]), ("42", "RUNNING", 0.5))
+        self.assertEqual(p["gpu"]["id"], "RTX 4090")
+        self.assertEqual(p["runtime"]["uptime"], 60)
+        self.assertEqual(pod.endpoint(p, 8000), "http://1.2.3.4:33526")
+        self.assertIsNone(pod.endpoint(p, 9000))     # that port is not published
+
+    def test_runpod_pods_keep_the_proxy(self):
+        # RunPod's pods carry their own "ports" list: not to be read as vast's mapping
+        p = {"id": "abc", "status": "RUNNING", "ports": ["8000/http"]}
+        self.assertEqual(pod.endpoint(p, 8000), pod.proxy_url("abc", 8000))
+
+    def test_statuses(self):
+        for raw, status in (("loading", "CREATED"), (None, "CREATED"), ("exited", "EXITED")):
+            self.assertEqual(vast.normalize({**self.INSTANCE, "actual_status": raw})["status"], status)
+        self.assertIn("EXITED", pod.DEAD_STATES)
+
+    def test_missing_instance_is_a_404(self):
+        v = vast.Vast("k")
+        with mock.patch.object(v, "_send", return_value={"instances": None}):
+            with self.assertRaises(vast.VastError) as ctx:
+                v.get_pod("42")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_rents_the_first_offer_left(self):
+        v = vast.Vast("k")
+        taken = vast.VastError(410, "no_such_ask Instance type 7 is no longer available.")
+        offers = [self.OFFER, {**self.OFFER, "id": 8, "dph_base": 0.45}]
+        with mock.patch.object(v, "search_offers", return_value=offers), \
+             mock.patch.object(v, "_request", side_effect=[taken, {"new_contract": 99}]) as req:
+            p = v.create_pod({"offer": {}, "instance": {"disk": 72}})
+        self.assertEqual(req.call_args[0][:2], ("PUT", "/asks/8/"))
+        self.assertEqual(p["id"], "99")
+        self.assertAlmostEqual(p["cost"], 0.45 + 0.36 * 72 / 720, places=3)
+
+    def test_no_offers_is_no_stock(self):
+        v = vast.Vast("k")
+        with mock.patch.object(v, "search_offers", return_value=[]):
+            with self.assertRaises(vast.VastError) as ctx:
+                v.create_pod({"offer": {}, "instance": {}})
+        self.assertTrue(cli.is_no_stock(ctx.exception))
+
+    def test_all_offers_taken_is_no_stock(self):
+        v = vast.Vast("k")
+        taken = vast.VastError(410, "no_such_ask")
+        with mock.patch.object(v, "search_offers", return_value=[self.OFFER]), \
+             mock.patch.object(v, "_request", side_effect=[taken]):
+            with self.assertRaises(vast.VastError) as ctx:
+                v.create_pod({"offer": {}, "instance": {}})
+        self.assertTrue(cli.is_no_stock(ctx.exception))
+
+    def test_refused_rent_is_not_no_stock(self):
+        v = vast.Vast("k")
+        refused = vast.VastError(400, "Invalid args")
+        with mock.patch.object(v, "search_offers", return_value=[self.OFFER]), \
+             mock.patch.object(v, "_request", side_effect=[refused]):
+            with self.assertRaises(vast.VastError) as ctx:
+                v.create_pod({"offer": {}, "instance": {}})
+        self.assertFalse(cli.is_no_stock(ctx.exception))
+
+    def test_gpu_catalog_groups_offers(self):
+        v = vast.Vast("k")
+        offers = [{"gpu_name": "RTX 4090", "gpu_ram": 24564, "dph_total": 0.5, "geolocation": "Norway, NO"},
+                  {"gpu_name": "RTX 4090", "gpu_ram": 24564, "dph_total": 0.4, "geolocation": "Texas, US"}]
+        with mock.patch.object(v, "search_offers", return_value=offers):
+            [g] = v.list_gpus("COMMUNITY")
+        self.assertEqual((g["id"], g["memory"], g["price"]["community"]), ("RTX 4090", 24, 0.4))
+        self.assertEqual([d["id"] for d in g["dataCenters"]], ["NO", "US"])
+        # the memory check reads it like RunPod's catalog
+        p = config.Profile("x", "m", ["NVIDIA GeForce RTX 4090"], [])
+        self.assertEqual(fit.fits(p, 10, [g])[0].vram_gb, 24)
+
+
+class VastLogs(unittest.TestCase):
+    def test_new_lines_only(self):
+        self.assertEqual(vast.new_lines(["a", "b", "c"], ["b", "c", "d"]), ["d"])
+        self.assertEqual(vast.new_lines(["a", "b"], ["a", "b"]), [])
+        self.assertEqual(vast.new_lines([], ["a"]), ["a"])
+        self.assertEqual(vast.new_lines(["a"], ["x", "y"]), ["x", "y"])   # window moved on
+
+    def test_poll_yields_each_line_once(self):
+        v = vast.Vast("k")
+        fetches = [["a", "b"], ["a", "b", "c"]]
+        poll = vast.LogPoll(v, "1", tail=1)
+
+        def fetch(pod_id, tail):
+            if not fetches:
+                poll.close()
+                return ["a", "b", "c"]
+            return fetches.pop(0)
+
+        with mock.patch.object(v, "fetch_logs", side_effect=fetch), \
+             mock.patch.object(vast.time, "sleep"):
+            self.assertEqual([e["line"] for e in v.stream_logs("1", resp=poll)], ["b", "c"])
+
+
+class GuardIdentity(unittest.TestCase):
+    def test_runpod_by_default(self):
+        with mock.patch.dict(os.environ, {"RUNPOD_POD_ID": "p", "RUNPOD_API_KEY": "k"}, clear=True):
+            self.assertEqual(guard.identity(), ("runpod", "p", "k"))
+
+    def test_vast(self):
+        env = {"RONIN_PROVIDER": "vast", "CONTAINER_ID": "42", "CONTAINER_API_KEY": "k"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(guard.identity(), ("vast", "42", "k"))
+        env = {"RONIN_PROVIDER": "vast", "VAST_CONTAINERLABEL": "C.38250", "CONTAINER_API_KEY": "k"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(guard.identity()[1], "38250")
+
+    def test_vast_deletes_its_instance(self):
+        env = {"RONIN_PROVIDER": "vast", "CONTAINER_ID": "42", "CONTAINER_API_KEY": "k"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(guard.urllib.request, "urlopen") as urlopen, \
+             mock.patch.object(guard, "log"):
+            self.assertTrue(guard.delete_self())
+        req = urlopen.call_args[0][0]
+        self.assertEqual((req.get_method(), req.full_url),
+                         ("DELETE", "https://console.vast.ai/api/v0/instances/42/"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer k")
+
+    def test_tunnel_url_is_read_from_the_log(self):
+        lines = ["noise", "[ronin-guard] tunnel https://abc-def.trycloudflare.com", "more"]
+        self.assertEqual(cli.tunnel_url(lines), "https://abc-def.trycloudflare.com")
+        self.assertIsNone(cli.tunnel_url(["no tunnel"]))
+        self.assertTrue(guard.TUNNEL_URL.search("|  https://abc-def.trycloudflare.com  |"))
+
+
+class ProviderState(ProjectTestCase):
+    def test_old_state_is_runpod(self):
+        cfg = config.load_config()
+        state = {"pod_id": "p1", "api_key": "k"}
+        self.assertEqual(pod.pod_provider(state), "runpod")
+        self.assertEqual(pod.pod_url(cfg, state), pod.proxy_url("p1", 8000))
+
+    def test_vast_pod_without_url_yet(self):
+        cfg = config.load_config()
+        state = {"pod_id": "42", "api_key": "k", "provider": "vast"}
+        self.assertIsNone(pod.pod_url(cfg, state))
+        with self.assertRaises(ConfigError):
+            pod.opencode_config(cfg, state)
+        state["url"] = "https://x.trycloudflare.com"
+        base = pod.opencode_config(cfg, state)["provider"]["ronin"]["options"]["baseURL"]
+        self.assertEqual(base, "https://x.trycloudflare.com/v1")
+
+    def test_down_clears_provider_and_url(self):
+        state = {"pod_id": "42", "api_key": "k", "provider": "vast", "url": "http://1.2.3.4:5"}
+        config.save_state(state)
+        pod.terminate(FakeRunPod(), state)
+        saved = config.load_state()
+        self.assertNotIn("provider", saved)
+        self.assertNotIn("url", saved)
+
+    def test_status_asks_the_pods_provider(self):
+        config.save_state({"pod_id": "42", "provider": "vast", "url": "http://1.2.3.4:5"})
+        rp = FakeRunPod({"id": "42", "status": "RUNNING", "runtime": {"uptime": 60}, "cost": 0.5})
+        with mock.patch.object(cli, "client", return_value=rp) as client, \
+             mock.patch.object(cli, "healthy", return_value=True), \
+             mock.patch("builtins.print"):
+            self.assertEqual(cli.cmd_status(mock.Mock(json=True), config.load_config()), cli.STATUS_READY)
+        client.assert_called_with("vast")
+
+
+class FakeVast:
+    name, label = "vast", "vast.ai"
+
+    def __init__(self):
+        self.created = []
+
+    def account(self):
+        return {"balance": 5.0, "spend_per_hour": 0.0}
+
+    def create_pod(self, body):
+        self.created.append(body)
+        return {"id": "42", "status": "CREATED", "gpu": {"id": "RTX 4090"}, "cost": 0.4,
+                "gpu_cost": 0.38, "where": "Norway, NO", "download_cost_per_gb": 0.01}
+
+    def get_pod(self, pod_id, timeout=None):
+        return {"id": "42", "provider": "vast", "status": "RUNNING", "cost": 0.4, "gpu": {"id": "RTX 4090"},
+                "runtime": {"uptime": 5}, "public_ip": "1.2.3.4", "ports": {8000: 33526}}
+
+
+class FakeLogs:
+    def __init__(self, *args, **kw):
+        pass
+
+    def drain(self):
+        return ["[ronin-guard] tunnel https://abc.trycloudflare.com"]
+
+
+class VastUp(ProjectTestCase):
+    toml = MINIMAL.replace('gpus = ["GPU A", "GPU B"]', 'gpus = ["RTX 4090"]') \
+                  .replace('[defaults]\n', '[defaults]\nprovider = "vast"\n')
+
+    def run_up(self, healthy):
+        rp = FakeVast()
+        args = mock.Mock(profile=None, skip_memory_check=True, max_hours=None, idle=None, budget=None,
+                         secure=False, max_wait=None, poll=None, keep_on_failure=False,
+                         provider=None)
+        with mock.patch.object(cli, "client", return_value=rp) as client, \
+             mock.patch.object(cli, "healthy", side_effect=healthy), \
+             mock.patch.object(cli, "LogStream", FakeLogs), \
+             mock.patch.object(cli, "LogSnapshot"), \
+             mock.patch.object(cli.time, "sleep"), \
+             mock.patch.object(cli.mascot, "show"), \
+             mock.patch("builtins.print"), mock.patch("sys.stdout"):
+            cli.cmd_up(args, config.load_config())
+        client.assert_called_with("vast")
+        return rp, config.load_state()
+
+    def test_up_records_the_https_tunnel(self):
+        rp, state = self.run_up(lambda url, timeout=10: True)
+        self.assertEqual(rp.created[0]["offer"]["gpu_name"], {"eq": "RTX 4090"})
+        self.assertEqual((state["pod_id"], state["provider"]), ("42", "vast"))
+        self.assertEqual(state["url"], "https://abc.trycloudflare.com")
+        self.assertEqual(state["history"][-1]["provider"], "vast")
+
+    def test_up_falls_back_to_plain_http(self):
+        # the tunnel URL is logged but never answers
+        with mock.patch.object(cli, "TUNNEL_WAIT", 0):
+            rp, state = self.run_up(lambda url, timeout=10: url.startswith("http://"))
+        self.assertEqual(state["url"], "http://1.2.3.4:33526")
+
+
+class DownloadSize(unittest.TestCase):
+    FILES = (("README.md", 10),
+             ("org_Model-Q4_K.gguf", 15), ("org_Model-Q4_K_M.gguf", 17),
+             ("IQ3_S/Model-IQ3_S-00001-of-00002.gguf", 55), ("IQ3_S/Model-IQ3_S-00002-of-00002.gguf", 29),
+             ("mmproj-Model-f16.gguf", 2), ("mmproj-Model-bf16.gguf", 3), ("mtp-Model-Q4_K_M.gguf", 4),
+             ("model-00001-of-00002.safetensors", 20), ("model-00002-of-00002.safetensors", 11))
+
+    def gguf(self, model, args=(), hf_file=None):
+        return config.Profile("x", model, ["G"], [], backend="llamacpp",
+                              llamacpp_args=list(args), hf_file=hf_file)
+
+    def names(self, profile):
+        return [f[0] for f in fit.download_files(profile, self.FILES)]
+
+    def test_quant_is_a_whole_token(self):
+        # Q4_K_M, not Q4_K; the MTP head is not part of the model download
+        self.assertEqual(self.names(self.gguf("o/m:Q4_K_M", ["--no-mmproj"])), ["org_Model-Q4_K_M.gguf"])
+        self.assertEqual(self.names(self.gguf("o/m:Q4_K", ["--no-mmproj"])), ["org_Model-Q4_K.gguf"])
+
+    def test_every_shard(self):
+        self.assertEqual(len(self.names(self.gguf("o/m:IQ3_S", ["--no-mmproj"]))), 2)
+
+    def test_default_quant_and_mmproj(self):
+        # no quant named: llama-server takes Q4_K_M; without --no-mmproj, the smallest projector
+        self.assertEqual(self.names(self.gguf("o/m")), ["org_Model-Q4_K_M.gguf", "mmproj-Model-f16.gguf"])
+
+    def test_exact_file(self):
+        self.assertEqual(self.names(self.gguf("o/m", ["--no-mmproj"], hf_file="org_Model-Q4_K.gguf")),
+                         ["org_Model-Q4_K.gguf"])
+
+    def test_vllm_downloads_the_safetensors(self):
+        p = config.Profile("x", "o/m", ["G"], [])
+        with mock.patch.object(fit, "repo_files", return_value=self.FILES):
+            self.assertAlmostEqual(fit.download_gb(p), 31 / 1e9)
+
+
+class Prices(ProjectTestCase):
+    toml = MINIMAL.replace('gpus = ["GPU A", "GPU B"]', 'gpus = ["RTX 4090", "L40S"]\ndisk_gb = 72')
+
+    def test_session_total(self):
+        q = cli.Quote("RTX 4090", stock="5 offers", gpu_h=0.40, disk_h=0.02, per_gb=0.01)
+        self.assertAlmostEqual(q.session(4, 18), 0.42 * 4 + 0.18)
+        self.assertAlmostEqual(q.session(4, None), 0.42 * 4)      # unknown size: GPU and disk only
+
+    def test_runpod_quotes(self):
+        cfg = config.load_config()
+        rp = mock.Mock(list_gpus=mock.Mock(return_value=[
+            {"id": "NVIDIA GeForce RTX 4090", "price": {"secure": 0.89}, "availability": "NONE"},
+            {"id": "NVIDIA L40S", "price": {"secure": 1.09}, "availability": "HIGH"}]))
+        q4090, ql40s = cli.runpod_quotes(rp, cfg, [cfg.profile(None)], "SECURE")["main"]
+        self.assertEqual((q4090.stock, q4090.gpu_h, q4090.note), (None, 0.89, "no stock"))
+        self.assertEqual((ql40s.stock, ql40s.gpu_h, ql40s.per_gb), ("HIGH", 1.09, 0))
+        self.assertAlmostEqual(ql40s.disk_h, 72 * 0.10 / 720)
+
+    def test_vast_quotes_search_once_per_distinct_offer(self):
+        cfg = config.load_config()
+        other = config.Profile("other", "o/m2", ["RTX 4090", "GPU nobody knows"], [], disk_gb=72)
+        rp = mock.Mock(quote=mock.Mock(side_effect=lambda f, disk: None if f["gpu_name"]["eq"] == "L40S"
+                                       else {"gpu": 0.4, "disk": 0.03, "download": 0.01, "offers": 50,
+                                             "hourly_max": 0.45, "download_max": 0.01}))
+        quotes = cli.vast_quotes(rp, cfg, [cfg.profile(None), other], "COMMUNITY")
+        self.assertEqual(rp.quote.call_count, 2)          # RTX 4090 is shared by both profiles
+        q4090, ql40s = quotes["main"]
+        self.assertEqual((q4090.stock, q4090.gpu_h, q4090.per_gb), ("50+ offers", 0.4, 0.01))
+        self.assertEqual((ql40s.stock, ql40s.note), (None, "no offers"))
+        self.assertEqual(quotes["other"][1].note, "not on vast.ai")
+
+    def test_vast_quote_is_the_offer_up_rents(self):
+        v = vast.Vast("k")
+        offers = [{"dph_base": 0.40, "storage_cost": 0.36, "inet_down_cost": 0.02},
+                  {"dph_base": 0.30, "storage_cost": 0.10, "inet_down_cost": 0.0}]
+        with mock.patch.object(v, "search_offers", return_value=offers):
+            q = v.quote({}, 72)
+        self.assertEqual((q["gpu"], q["download"], q["offers"]), (0.40, 0.02, 2))
+        self.assertAlmostEqual(q["disk"], 0.36 * 72 / 720)
+
+    def test_command_prints_every_profile(self):
+        cfg = config.load_config()
+        rp = mock.Mock(label="RunPod", list_gpus=mock.Mock(return_value=[
+            {"id": "NVIDIA L40S", "price": {"secure": 1.09}, "availability": "HIGH"}]))
+        args = mock.Mock(provider="runpod", secure=True, profiles=[], hours=2)
+        with mock.patch.object(cli, "client", return_value=rp), \
+             mock.patch.object(fit, "download_gb", return_value=30.0), \
+             mock.patch("builtins.print") as out:
+            cli.cmd_prices(args, cfg)
+        text = "\n".join(str(c.args[0]) if c.args else "" for c in out.call_args_list)
+        self.assertIn("main", text)
+        self.assertIn(f"${(1.09 + 72 * 0.10 / 720) * 2:.2f}", text)   # 2 h session, free download
+
+
+class Integrity(ProjectTestCase):
+    """ronin.toml is checked as a whole before anything is built from it."""
+
+    def problems(self, text):
+        (self.root / "ronin.toml").write_text(text, encoding="utf-8")
+        with self.assertRaises(ConfigError) as ctx:
+            config.load_config()
+        return str(ctx.exception)
+
+    def test_shipped_configs_are_sound(self):
+        config.load_config(config.SOURCE_ROOT / "ronin.toml")
+        import tomllib
+        self.assertEqual(config.validate(tomllib.loads(config.STARTER_CONFIG)), [])
+
+    def test_wrong_types_are_reported_not_raised(self):
+        text = self.problems(MINIMAL + 'disk_gb = "big"\n')
+        self.assertIn("disk_gb must be an integer", text)
+        text = self.problems(MINIMAL.replace('[defaults]\n', '[defaults]\nport = "80a"\n'))
+        self.assertIn("port must be an integer", text)
+
+    def test_typos_suggest_the_key(self):
+        text = self.problems(MINIMAL + 'vlm_args = ["--x"]\n')
+        self.assertIn("unknown key 'vlm_args' (did you mean 'vllm_args'?)", text)
+
+    def test_key_in_the_wrong_table(self):
+        text = self.problems(MINIMAL + "max_hours = 3\n")
+        self.assertIn("unknown key 'max_hours' (it belongs in [defaults])", text)
+
+    def test_args_as_one_string(self):
+        text = self.problems(MINIMAL.replace(
+            'vllm_args = ["--max-model-len", "65536", "--enable-prefix-caching"]',
+            'vllm_args = "--max-model-len 65536"'))
+        self.assertIn('vllm_args must be a list, e.g. ["--max-model-len", "65536"]', text)
+
+    def test_two_arguments_in_one_item(self):
+        text = self.problems(MINIMAL.replace('"--max-model-len", "65536"', '"--max-model-len 65536"'))
+        self.assertIn("holds several arguments", text)
+
+    def test_values_and_ranges(self):
+        text = self.problems(MINIMAL.replace('[defaults]\n', '[defaults]\ncloud = "secure"\n')
+                             + "gpu_count = 0\n")
+        self.assertIn("cloud must be 'SECURE' or 'COMMUNITY'", text)
+        self.assertIn("gpu_count must be between 1 and 8", text)
+
+    def test_every_problem_at_once(self):
+        text = self.problems(MINIMAL + 'disk_gb = "big"\nvlm_args = []\n[pod]\nx = 1\n')
+        self.assertIn("3 problems", text)
+        self.assertIn("unknown table [pod]", text)
+
+    def test_other_backends_args(self):
+        text = self.problems(MINIMAL.replace('model = "org/model"', 'model = "org/model"\nbackend = "llamacpp"'))
+        self.assertIn("backend 'llamacpp' ignores vllm_args", text)
+
+    def test_extends_unknown_profile(self):
+        text = self.problems(MINIMAL + '\n[profiles.b]\nextends = "nope"\n')
+        self.assertIn("extends unknown profile 'nope'", text)
+
+    def test_vast_needs_known_gpus(self):
+        text = self.problems(MINIMAL.replace('[defaults]\n', '[defaults]\nprovider = "vast"\n'))
+        self.assertIn("'GPU A' is not in ronin's GPU table", text)
+
+    def test_numbers_as_args_and_cuda_as_number(self):
+        (self.root / "ronin.toml").write_text(
+            MINIMAL.replace('"65536"', "65536") + "min_cuda = 12.8\n", encoding="utf-8")
+        p = config.load_config().profile(None)
+        self.assertEqual((p.vllm_args[1], p.min_cuda), ("65536", "12.8"))
+
+
+class BrokenConfigStillStops(ProjectTestCase):
+    """A broken ronin.toml must never keep `ronin down` from deleting a billing pod."""
+
+    def test_down_works_with_a_broken_config(self):
+        config.save_state({"pod_id": "p1", "api_key": "k"})
+        (self.root / "ronin.toml").write_text(MINIMAL + 'disk_gb = "big"\n', encoding="utf-8")
+        rp = FakeRunPod({"id": "p1", "status": "RUNNING", "runtime": {"uptime": 60}, "cost": 1.0})
+        with mock.patch.object(cli, "client", return_value=rp), \
+             mock.patch.object(cli.mascot, "show"), mock.patch("builtins.print"), \
+             mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            cli.main(["--config", str(self.root / "ronin.toml"), "down"])
+        self.assertEqual(rp.deleted, ["p1"])
+        self.assertNotIn("pod_id", config.load_state())
+
+    def test_up_refuses_a_broken_config(self):
+        (self.root / "ronin.toml").write_text(MINIMAL + 'disk_gb = "big"\n', encoding="utf-8")
+        with mock.patch.object(cli, "client") as client, mock.patch("builtins.print"), \
+             mock.patch("sys.stdout"), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli.main(["--config", str(self.root / "ronin.toml"), "up"])
+        client.assert_not_called()
+
+    def test_unexpected_errors_are_logged_with_a_billing_hint(self):
+        config.save_state({"pod_id": "p1", "api_key": "k"})
+        with mock.patch.object(cli, "cmd_status", side_effect=KeyError("boom")), \
+             mock.patch("builtins.print"), mock.patch("sys.stdout"), mock.patch("sys.stderr"), \
+             mock.patch.object(cli.ui, "error") as error, mock.patch.object(cli.ui, "hint") as hint, \
+             self.assertRaises(SystemExit):
+            cli.main(["--config", str(self.root / "ronin.toml"), "status"])
+        self.assertIn("KeyError", error.call_args[0][0])
+        self.assertTrue((self.root / ".ronin" / "last-error.log").exists())
+        self.assertTrue(any("ronin down" in str(c) for c in hint.call_args_list))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class Budget(unittest.TestCase):
+    """--budget: the guard's deadline from what the pod costs, priced before creating it."""
+
+    def plan(self, quotes, budget, provider="runpod", gb=0.0, candidates=("GPU A", "GPU B")):
+        rp = mock.Mock()
+        rp.name = provider
+        cfg, profile = mock.Mock(), mock.Mock()
+        profile.name = "main"
+        fake = mock.Mock(return_value={"main": quotes})
+        with mock.patch.object(cli, "runpod_quotes", fake), mock.patch.object(cli, "vast_quotes", fake), \
+             mock.patch.object(cli.fit, "download_gb", return_value=gb), mock.patch.object(cli.ui, "warn"):
+            return cli.budget_plan(rp, cfg, profile, [fit.Fit(c, None, None) for c in candidates],
+                                   ["COMMUNITY"], budget)
+
+    def test_hours_from_gpu_and_disk(self):
+        plan = self.plan([cli.Quote("GPU A", gpu_h=1.69, disk_h=0.03)], 5.16)
+        self.assertAlmostEqual(plan[("GPU A", "COMMUNITY")]["hours"], 3.0)
+
+    def test_vast_counts_the_download_and_the_dearest_fallback_offer(self):
+        q = cli.Quote("GPU A", gpu_h=0.4, disk_h=0.05, per_gb=0.01, hourly_max=0.5, per_gb_max=0.02)
+        plan = self.plan([q], 3.0, provider="vast", gb=50)
+        self.assertAlmostEqual(plan[("GPU A", "COMMUNITY")]["download"], 1.0)
+        self.assertAlmostEqual(plan[("GPU A", "COMMUNITY")]["hours"], 4.0)    # (3 - 1) / 0.5
+
+    def test_gpus_the_budget_cannot_keep_are_skipped(self):
+        plan = self.plan([cli.Quote("GPU A", gpu_h=10.0), cli.Quote("GPU B", gpu_h=1.0),
+                          cli.Quote("GPU C")], 2.0)
+        self.assertEqual(list(plan), [("GPU B", "COMMUNITY")])
+
+    def test_too_small_a_budget_creates_nothing(self):
+        with self.assertRaises(ConfigError) as ctx:
+            self.plan([cli.Quote("GPU A", gpu_h=10.0)], 1.0)
+        self.assertIn("not enough", str(ctx.exception))
+        with self.assertRaises(ConfigError):
+            self.plan([cli.Quote("GPU A", gpu_h=1.0)], 0)
+
+
+class Runway(unittest.TestCase):
+    def warning(self, balance, spend, deadline_in=None):
+        state = {"deadline": cli.time.time() + deadline_in * 3600} if deadline_in else {}
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            return " ".join(cli.runway_warning({"balance": balance, "spend_per_hour": spend}, state))
+
+    def test_warns_before_the_guard_deadline(self):
+        # seen live: $5.38 at $1.72/h lasts ~3 h, the guard allowed 7 h more
+        text = self.warning(5.38, 1.72, deadline_in=7)
+        self.assertIn("lasts ≈ 3h 07m", text)
+        self.assertIn("before the guard's deadline", text)
+
+    def test_quiet_when_the_balance_outlasts_the_pod(self):
+        self.assertEqual(self.warning(50, 1.72, deadline_in=7), "")
+        self.assertEqual(self.warning(5, 0), "")                # nothing billing
+
+    def test_warns_when_little_is_left_without_a_guard(self):
+        self.assertIn("lasts ≈ 1h 00m", self.warning(1.72, 1.72))
+
+
+class Orphans(ProjectTestCase):
+    def test_pods_named_by_ronin_but_not_registered(self):
+        rp = mock.Mock(list_pods=mock.Mock(return_value=[
+            {"id": "mine", "name": "ronin-main"}, {"id": "lost", "name": "ronin-big", "status": "RUNNING"},
+            {"id": "x", "name": "someone-else"}]))
+        rp.name = "runpod"
+        with mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k"}), \
+             mock.patch.object(pod, "client", return_value=rp):
+            found = pod.orphans({"pod_id": "mine", "provider": "runpod"})
+        self.assertEqual([p["id"] for _, p in found], ["lost"])
+
+    def test_providers_without_a_key_or_unreachable_are_skipped(self):
+        rp = mock.Mock(list_pods=mock.Mock(side_effect=RunPodError(0, "offline")))
+        with mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k"}), \
+             mock.patch.object(pod, "client", return_value=rp):
+            self.assertEqual(pod.orphans({}), [])
+
+
+class VastBilling(unittest.TestCase):
+    def test_charges_become_billing_rows_across_pages(self):
+        pages = [{"results": [{"type": "instance", "source": "Instance-42", "amount": 0.5,
+                               "start": 1_793_000_000, "end": 1_793_003_600}],
+                  "next_token": "t"},
+                 {"results": [{"type": "instance", "source": "43", "amount": 0.2,
+                               "start": 1_793_000_000, "end": 1_793_000_600}]}]
+        v = vast.Vast("k")
+        with mock.patch.object(v, "_request", side_effect=pages) as req:
+            rows = v.pod_billing("2026-10-20T00:00:00Z", bucket="day")
+        self.assertEqual([r["podId"] for r in rows], ["42", "43"])
+        self.assertEqual(rows[0]["timeBilledMs"], 3_600_000)
+        self.assertEqual(req.call_args_list[1].kwargs["query"]["after_token"], "t")
+        self.assertAlmostEqual(cli.billed_by_pod(rows)["42"]["amount"], 0.5)
